@@ -21,7 +21,10 @@ class OpenSearchDataIngestor:
         self.max_tokens = 512
         self.language = language
 
-    def ingest(self, corpus: Dict[str, Dict[str, str]], index: str):
+    def ingest(self, corpus: Dict[str, Dict[str, str]], index: str, pipeline_name: str = 'nlp-ingest-pipeline'):
+        index_settings='{"mappings":{"properties":{"passage_embedding":{"type":"knn_vector","dimension":768,"method":{"engine":"lucene","space_type":"l2","name":"hnsw","parameters":{}}},"passage_text":{"type":"text","fields":{"keyword":{"type":"keyword","ignore_above":256}}},"text_key":{"type":"text","fields":{"keyword":{"type":"keyword","ignore_above":256}}},"title_key":{"type":"text","fields":{"keyword":{"type":"keyword","ignore_above":256}}}}},"settings":{"index":{"knn":true,"default_pipeline":"nlp-ingest-pipeline","replication":{"type":"DOCUMENT"},"number_of_shards":"3","number_of_replicas":"1"}}}'
+        self.opensearch.indices.create(index=index, body=index_settings)
+
         '''for i in range(0, 200, self.bulk_size):'''
         for i in range(0, len(corpus), self.bulk_size):
             key_list = itertools.islice(corpus.keys(), i, i + self.bulk_size)
@@ -56,7 +59,8 @@ class OpenSearchDataIngestor:
             # actions[1::2] = [{'passage_text': corpus[key_id]['text']} for key_id in key_list]
             self.opensearch.bulk(
                 index=index,
-                body=actions)
+                body=actions,
+                pipeline=pipeline_name)
 
             if i % 1000 == 0:
                 print("Ingested " + str(i) + " documents")

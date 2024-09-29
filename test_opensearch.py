@@ -87,7 +87,8 @@ def evaluate(corpus, endpoint, index, model_id, port, qrels, queries, num_of_run
     # for method in ['bm25', 'neural', 'hybrid']:
     # for method in ['hybrid']:
     # for method in ['neural']:
-
+    results_bm25={}
+    results_neural={}
     if 'bm25' in mm:
         method = 'bm25'
         print('starting search method ' + method)
@@ -98,7 +99,9 @@ def evaluate(corpus, endpoint, index, model_id, port, qrels, queries, num_of_run
                                           pipeline_name=pipelines.split(',')[0])
         retriever = EvaluateRetrieval(os_retrival, bm25_k_values)
         result_size = max(bm25_k_values)
-        results = os_retrival.search_bm25(corpus, queries, top_k=result_size)
+        results, took_time_bm25= os_retrival.search_bm25(corpus, queries, top_k=result_size)
+        results_bm25=results
+        #print(results_bm25)
         ndcg, _map, recall, precision = retriever.evaluate(qrels, results, k_values)
         print('--- end of results for ' + method)
 
@@ -116,14 +119,26 @@ def evaluate(corpus, endpoint, index, model_id, port, qrels, queries, num_of_run
             top_k = max(model_k_values)
             result_size = max(bm25_k_values)
             # results = retriever.retrieve(corpus, queries)
-            all_experiments_took_time = []
-            for run in range(0, num_of_runs):
-                results, took_time = os_retrival.search_vector(corpus, queries, top_k=top_k, result_size=result_size)
-                all_experiments_took_time.append(took_time)
-                ndcg, _map, recall, precision = retriever.evaluate(qrels, results, k_values)
+            #all_experiments_took_time = []
+            #for run in range(0, num_of_runs):
+            results,took_time_neural = os_retrival.search_vector(corpus, queries, top_k=top_k, result_size=result_size)
+            #all_experiments_took_time.append(took_time)
+            ndcg, _map, recall, precision = retriever.evaluate(qrels, results, k_values)
+            
+            results_neural=results
             # print('Total time: ' + str(total_time))
-            retriever.evaluate_time(all_experiments_took_time)
-            print('--- end of results for ' + method + " and pipeline " + pipeline)
+            #retriever.evaluate_time(all_experiments_took_time)
+            #print('--- end of results for ' + method + " and pipeline " + pipeline)
+
+    results_hybrid , took_time_hybrid= os_retrival.hybridizeSearchResults(queries,results_bm25,results_neural)
+    ndcg, _map, recall, precision = retriever.evaluate(qrels, results_hybrid, k_values)
+    all_experiments_took_time = []
+    total_time={}
+    for key, hybrid_time in took_time_hybrid.items():
+        total_time[key]= hybrid_time + took_time_bm25[key] + took_time_neural[key]
+    all_experiments_took_time.append(total_time)
+    retriever.evaluate_time(all_experiments_took_time)
+
 
     # method = 'hybrid'
     # print('starting search method ' + method)
