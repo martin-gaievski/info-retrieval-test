@@ -2,7 +2,9 @@
 import logging
 import textwrap
 import random
+import numpy as np
 from typing import Dict, List
+import time
 from opensearchpy import OpenSearch, RequestsHttpConnection
 
 logger = logging.getLogger(__name__)
@@ -76,6 +78,7 @@ class RetrievalOpenSearch:
         logger.info("Encoding Queries...")
         query_ids = list(queries.keys())
         self.results = {qid: {} for qid in query_ids}
+        self.took_time = {qid: {} for qid in query_ids}
         queries = [queries[qid] for qid in queries]
 
         logger.info("Sorting Corpus by document length (Longest first)...")
@@ -117,8 +120,9 @@ class RetrievalOpenSearch:
                 corp_id = hit['_id']
                 if corp_id != query_id:
                     self.results[query_id][corp_id] = hit['_score']
+            self.took_time[query_id] = int(query_responses[i]['took'])
 
-        return self.results
+        return self.results, self.took_time
 
     # def search_bm25(self,
     #                 corpus: Dict[str, Dict[str, str]],
@@ -216,6 +220,96 @@ class RetrievalOpenSearch:
     #     index_name = self.index_name
     #
     #     query_responses = []
+
+    def normalizeSingleScore(self,score: float, min_score: float, max_score: float) -> float:
+        if max_score == min_score and max_score == score:
+            return 1.0
+       
+        normalized_score = (score - min_score)/(max_score - min_score)
+        return 0.001 if normalized_score == 0.0 else normalized_score
+ 
+ 
+    def combineScore(self,normalizedScores: List[float]) -> float:
+         weights = [1.0, 1.0]
+         combined_score =0.0
+         sum_of_weights =0.0
+
+         for index_of_subquery in range(len(normalizedScores)):
+             score = normalizedScores[index_of_subquery]
+             if score > 0.0:
+                weight = weights[index_of_subquery]
+                score += score * weight
+                combined_score += score
+                sum_of_weights += weight
+           
+         if sum_of_weights == 0.0:
+             return 0.0
+
+         return combined_score / sum_of_weights
+
+
+    def hybridizeSearchResults(self, queries: Dict[str, str], results_bm_25, results_neural):
+        query_ids = list(queries.keys())
+        self.took_time = {qid: {} for qid in query_ids}
+        start_time = round(time.time() * 1000)
+        results_hybrid = {}
+        for query_id in query_ids:
+         min_per_subquery = np.full(2, np.finfo(np.float64).max, dtype=np.float64)
+         max_per_subquery = np.full(2, np.finfo(np.float64).min, dtype=np.float64)
+         for hitId , score in results_bm_25[query_id].items():
+             min_per_subquery[0]=min(score , min_per_subquery[0]) 
+             max_per_subquery[0]=max(score , max_per_subquery[0])
+
+         for hitId, score in results_neural[query_id].items():
+             min_per_subquery[1]=min(score , min_per_subquery[1])
+             max_per_subquery[1]=max(score , max_per_subquery[1])
+
+         #print("min result for bm25: " , min_per_subquery[0])    
+        # print("max result for bm25: " , max_per_subquery[0])    
+         #print("min result for neural: " , min_per_subquery[1])   
+         #print("max result for neural: " , max_per_subquery[1])   
+        
+         normalizedScorePerDocument = {}
+        #for query_id in query_ids:
+         for hitId , score in results_bm_25[query_id].items():
+             results_bm_25[query_id][hitId] = self.normalizeSingleScore(score, min_per_subquery[0], max_per_subquery[0])
+             if hitId in normalizedScorePerDocument:
+                 raise ValueError(f"duplicate hitId {hitId}") 
+                # normalizedScorePerDocument[hitId].append(results_bm_25[query_id][hitId])
+             else:
+                 normalizedScorePerDocument[hitId] = [results_bm_25[query_id][hitId]]
+
+         for hitId, score in results_neural[query_id].items():
+             results_neural[query_id][hitId] = self.normalizeSingleScore(score, min_per_subquery[1], max_per_subquery[1])
+             if hitId in normalizedScorePerDocument:
+                 normalizedScorePerDocument[hitId].append(results_neural[query_id][hitId])
+             else:
+                 normalizedScorePerDocument[hitId] = [results_neural[query_id][hitId]]
+       
+         combinedScorePerDocument = {}
+
+         for hitId , normalizedScores in normalizedScorePerDocument.items():
+             if len(normalizedScores) > 2:
+                 raise ValueError ("error")
+
+             combinedScorePerDocument[hitId] = self.combineScore(normalizedScores)
+
+         
+         sorted_hit_scores = dict(sorted(combinedScorePerDocument.items(), key = lambda item: item[1], reverse=True))
+        
+         #for hitId, score in sorted_hit_scores[query_id].items():
+             #print(f"query_id {query_id} HitId {hitId}, Score: {score}")    
+
+         results_hybrid[query_id]=sorted_hit_scores
+         end_time = round(time.time() * 1000)
+         self.took_time[query_id]=end_time-start_time
+
+        return results_hybrid,self.took_time
+
+
+
+
+
 
     """
         Function works with vector based searches, knn/neural and hybrid
@@ -357,8 +451,7 @@ class RetrievalOpenSearch:
         for r in range(0, min(100, len(query_ids))):
             q = random.choice(queries)
             self.opensearch.search(index=index_name,
-                                   body=get_body_vector(get_doc_text(q)),
-                                   params={"search_pipeline": self.pipeline_name})
+                                   body=get_body_vector(get_doc_text(q)))
         logger.info("Finished warmup queries")
 
         for i in range(0, len(query_ids)):
@@ -373,7 +466,7 @@ class RetrievalOpenSearch:
 
             query_responses.append(query_response)
             if i % 50 == 0:
-                print("Executed queries: " + str(i))
+               print("Executed queries: " + str(i))
 
         ids = [[hit['_id']
                 for hit in query_response['hits']['hits']]
@@ -387,4 +480,4 @@ class RetrievalOpenSearch:
                     self.results[query_id][corp_id] = hit['_score']
             self.took_time[query_id] = int(query_responses[i]['took'])
 
-        return self.results, self.took_time
+        return self.results,self.took_time
