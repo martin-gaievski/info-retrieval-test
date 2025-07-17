@@ -17,7 +17,7 @@ class OpenSearchDataIngestor:
             connection_class=RequestsHttpConnection,
             timeout=timeout
         )
-        self.bulk_size = 200
+        self.bulk_size = 400
         self.max_tokens = 512
         self.language = language
 
@@ -41,6 +41,18 @@ class OpenSearchDataIngestor:
 
             def get_content(corpus_doc):
                 if 'title' in corpus_doc.keys():
+                    '''try:
+                        pubmed_id = int(corpus_doc['metadata']['pubmed_id']) if corpus_doc['metadata']['pubmed_id'] else None
+                    except (KeyError, ValueError, TypeError):
+                        pubmed_id = None
+                    return {
+                        'passage_text': cleanup(get_doc_text((corpus_doc["title"] + ' ' + corpus_doc["text"]).strip())), 
+                        'text_key': cleanup(corpus_doc['text']), 
+                        'title_key': cleanup(corpus_doc['title']),
+                        'url': corpus_doc['metadata']['url'],
+                        'pubmed_id': pubmed_id
+                        }
+                    '''
                     return {
                         'passage_text': cleanup(get_doc_text((corpus_doc["title"] + ' ' + corpus_doc["text"]).strip())), 'text_key': cleanup(corpus_doc['text']), 'title_key': cleanup(corpus_doc['title'])}
                 else:

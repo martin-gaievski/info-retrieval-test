@@ -102,6 +102,7 @@ class GenericDataLoader:
                 self.corpus[line.get("_id")] = {
                     "text": line.get("text"),
                     "title": line.get("title"),
+                    #"metadata": line.get("metadata")
                 }
     
     def _load_queries(self):

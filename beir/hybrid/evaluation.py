@@ -15,19 +15,22 @@ class EvaluateRetrieval:
         self.top_k = max(k_values)
         self.retriever = retriever
 
-    # def retrieve(self, corpus: Dict[str, Dict[str, str]], queries: Dict[str, str], **kwargs) -> Dict[
-    #     str, Dict[str, float]]:
-    #     if not self.retriever:
-    #         raise ValueError("Model/Technique has not been provided!")
-    #     return self.retriever.search(corpus, queries, self.top_k, **kwargs)
-
     @staticmethod
     def evaluate(qrels: Dict[str, Dict[str, int]],
-                 results: Dict[str, Dict[str, float]],
-                 k_values: List[int],
-                 ignore_identical_ids: bool = True) -> Tuple[
+                results: Dict[str, Dict[str, float]],
+                k_values: List[int],
+                ignore_identical_ids: bool = True) -> Tuple[
         Dict[str, float], Dict[str, float], Dict[str, float], Dict[str, float]]:
-
+        """
+        Evaluate search results using multiple metrics.
+        
+        Args:
+            qrels: Dictionary of query relevance scores {query_id: {doc_id: relevance_score}}
+            results: Dictionary of search results {query_id: {doc_id: score}}
+            k_values: List of k values for @k metrics
+            ignore_identical_ids: Whether to ignore documents with same ID as query
+        """
+        
         if ignore_identical_ids:
             logging.info(
                 'For evaluation, we ignore identical query and document ids (default), please explicitly set ``ignore_identical_ids=False`` to ignore this.')
@@ -43,36 +46,62 @@ class EvaluateRetrieval:
         recall = {}
         precision = {}
 
+        # Initialize metric dictionaries
         for k in k_values:
             ndcg[f"NDCG@{k}"] = 0.0
             _map[f"MAP@{k}"] = 0.0
             recall[f"Recall@{k}"] = 0.0
             precision[f"P@{k}"] = 0.0
 
+        # Prepare evaluation strings
         map_string = "map_cut." + ",".join([str(k) for k in k_values])
         ndcg_string = "ndcg_cut." + ",".join([str(k) for k in k_values])
         recall_string = "recall." + ",".join([str(k) for k in k_values])
         precision_string = "P." + ",".join([str(k) for k in k_values])
+        
         evaluator = pytrec_eval.RelevanceEvaluator(qrels, {map_string, ndcg_string, recall_string, precision_string})
         scores = evaluator.evaluate(results)
 
+        # Calculate average metrics for each k
+        k_metrics = {
+            'ndcg': {k: [] for k in k_values},
+            'map': {k: [] for k in k_values},
+            'recall': {k: [] for k in k_values},
+            'precision': {k: [] for k in k_values}
+        }
+
+        # Accumulate scores per k value
         for query_id in scores.keys():
             for k in k_values:
-                ndcg[f"NDCG@{k}"] += scores[query_id]["ndcg_cut_" + str(k)]
-                _map[f"MAP@{k}"] += scores[query_id]["map_cut_" + str(k)]
-                recall[f"Recall@{k}"] += scores[query_id]["recall_" + str(k)]
-                precision[f"P@{k}"] += scores[query_id]["P_" + str(k)]
+                k_metrics['ndcg'][k].append(scores[query_id]["ndcg_cut_" + str(k)])
+                k_metrics['map'][k].append(scores[query_id]["map_cut_" + str(k)])
+                k_metrics['recall'][k].append(scores[query_id]["recall_" + str(k)])
+                k_metrics['precision'][k].append(scores[query_id]["P_" + str(k)])
 
+        # Calculate average scores for each k
         for k in k_values:
-            ndcg[f"NDCG@{k}"] = round(ndcg[f"NDCG@{k}"] / len(scores), 5)
-            _map[f"MAP@{k}"] = round(_map[f"MAP@{k}"] / len(scores), 5)
-            recall[f"Recall@{k}"] = round(recall[f"Recall@{k}"] / len(scores), 5)
-            precision[f"P@{k}"] = round(precision[f"P@{k}"] / len(scores), 5)
+            ndcg[f"NDCG@{k}"] = round(np.mean(k_metrics['ndcg'][k]), 5)
+            _map[f"MAP@{k}"] = round(np.mean(k_metrics['map'][k]), 5)
+            recall[f"Recall@{k}"] = round(np.mean(k_metrics['recall'][k]), 5)
+            precision[f"P@{k}"] = round(np.mean(k_metrics['precision'][k]), 5)
 
-        for eval in [ndcg, _map, recall, precision]:
+        # Calculate mean and median using the @k values
+        for metric_name, metric_dict, scores_key in [
+            ('NDCG', ndcg, 'ndcg'),
+            ('MAP', _map, 'map'),
+            ('Recall', recall, 'recall'),
+            ('P', precision, 'precision')
+        ]:
+            # Calculate mean and median across k values
+            k_averages = [metric_dict[f"{metric_name}@{k}"] for k in k_values]
+            metric_dict[f"{metric_name}_mean"] = round(np.mean(k_averages), 5)
+            metric_dict[f"{metric_name}_median"] = round(np.median(k_averages), 5)
+
+        # Log results
+        for eval_metric in [ndcg, _map, recall, precision]:
             logging.info("\n")
-            for k in eval.keys():
-                logging.info("{}: {:.4f}".format(k, eval[k]))
+            for k in eval_metric.keys():
+                logging.info("{}: {:.4f}".format(k, eval_metric[k]))
 
         return ndcg, _map, recall, precision
 

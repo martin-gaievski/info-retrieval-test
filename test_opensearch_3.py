@@ -9,17 +9,18 @@ import pathlib, os, getopt, sys
 
 
 def main(argv):
-    opts, args = getopt.getopt(argv, "d:u:h:p:i:m:o:s:",
+    opts, args = getopt.getopt(argv, "d:u:h:p:i:m:o:s:q:",
                                ["dataset=", "dataset_url=", "os_host=", "os_port=", "os_index=", "os_model_id=",
-                                "operation=", "subset="])
-    dataset = ''
+                                "operation=", "subset=", "qty="])
+    dataset = 'nfcorpus' # use nfcorpus by default
     url = ''
     endpoint = ''
     port = ''
     index = ''
     model_id = ''
-    operation = 'both'  # default value
+    operation = 'both' # default value
     subset = None
+    qty = sys.maxsize # max number of queries we want to process, everything by default
     for opt, arg in opts:
         if opt in ("-d", "-dataset"):
             dataset = arg
@@ -37,6 +38,8 @@ def main(argv):
             operation = arg
         elif opt in ("-s", "-subset"):
             subset = arg
+        elif opt in ("-q", "-qty"):
+            qty = int(arg)
 
     #### Just some code to print debug information to stdout
     logging.basicConfig(format='%(asctime)s - %(message)s',
@@ -66,21 +69,21 @@ def main(argv):
         ingest_data(corpus, endpoint, index, port)
 
     if operation in ['search', 'both']:
-        evaluate(corpus, endpoint, index, model_id, port, qrels, queries)
+        evaluate(corpus, endpoint, index, model_id, port, qrels, queries, qty)
 
 
 def ingest_data(corpus, endpoint, index, port):
     OpenSearchDataIngestor(endpoint, port).ingest(corpus, index=index)
 
 
-def evaluate(corpus, endpoint, index, model_id, port, qrels, queries):
+def evaluate(corpus, endpoint, index, model_id, port, qrels, queries, qty):
     # This k values are being used for BM25 search
     # bm25_k_values = [1, 3, 5, 10, 100, min(9999, len(corpus))]
-    bm25_k_values = [1, 3, 5, 10, 200]
+    bm25_k_values = [1, 3, 5, 10, 25, 50, 100, 200]
     # This K values are being used for dense model search
-    model_k_values = [1, 3, 5, 10, 200]
+    model_k_values = [1, 3, 5, 10, 25, 50, 100, 200]
     # this k values are being used for scoring
-    k_values = [5, 10, 100]
+    k_values = [1, 3, 5, 10, 25, 50, 100, 200]
     # for method in ['bm25', 'neural', 'hybrid']:
     # for method in ['hybrid']:
     # for method in ['neural']:
@@ -110,7 +113,7 @@ def evaluate(corpus, endpoint, index, model_id, port, qrels, queries):
         top_k = max(model_k_values)
         result_size = max(bm25_k_values)
         # results = retriever.retrieve(corpus, queries)
-        results = os_retrival.search_vector(corpus, queries, top_k=top_k, result_size=result_size)
+        results = os_retrival.search_vector(corpus, queries, top_k=top_k, result_size=result_size, query_limit=qty, skip_warmups=True)
 
         # Get the raw search results
         # raw_results = os_retrival.search_vector(corpus, queries, top_k=top_k, result_size=result_size)

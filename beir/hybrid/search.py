@@ -1,7 +1,7 @@
 # from beir.retrieval.search.util import cos_sim, dot_score
 import logging
 import textwrap
-import random
+import random, sys
 from typing import Dict, List
 from opensearchpy import OpenSearch, RequestsHttpConnection
 
@@ -52,6 +52,11 @@ class RetrievalOpenSearch:
         def get_body_bm25(query_text):
             return {
                 'size': top_k,
+                '_source': {
+                    'exclude': [
+                        'passage_embedding'
+                    ]
+                },
                 'query': {
                     'multi_match': {
                         'query': query_text,
@@ -225,6 +230,8 @@ class RetrievalOpenSearch:
                       queries: Dict[str, str],
                       top_k: int,
                       result_size: int,
+                      query_limit: int = sys.maxsize,
+                      skip_warmups: bool = True,
                       return_sorted: bool = False, **kwargs) -> Dict[str, Dict[str, float]]:
         # def get_body(k, query_text, model_id):
         #     return {
@@ -242,6 +249,11 @@ class RetrievalOpenSearch:
         def get_body_hybrid(query_text):
             return {
                 'size': result_size,
+                '_source': {
+                    'exclude': [
+                        'passage_embedding'
+                    ]
+                },
                 'query': {
                     "hybrid": {
                         "queries": [
@@ -270,6 +282,11 @@ class RetrievalOpenSearch:
         def get_body_bool(query_text):
             return {
                 'size': result_size,
+                '_source': {
+                    'exclude': [
+                        'passage_embedding'
+                    ]
+                },
                 'query': {
                     "bool": {
                         "must": [
@@ -347,15 +364,19 @@ class RetrievalOpenSearch:
                                         break_on_hyphens=False)
             return full_string if len(str_as_list) == 0 else str_as_list[0]
 
-        logger.info("Starting warmup queries")
-        for r in range(0, min(100, len(query_ids))):
-            q = random.choice(queries)
-            self.opensearch.search(index=index_name,
-                                   body=get_body_vector(get_doc_text(q)),
-                                   params={"search_pipeline": self.pipeline_name})
-        logger.info("Finished warmup queries")
-
-        for i in range(0, len(query_ids)):
+        if not skip_warmups:
+            logger.info("Starting warmup queries")
+            for r in range(0, min(100, len(query_ids))):
+                q = random.choice(queries)
+                self.opensearch.search(index=index_name,
+                                    body=get_body_vector(get_doc_text(q)),
+                                    params={"search_pipeline": self.pipeline_name})
+            logger.info("Finished warmup queries")
+        else:
+            logger.info("Skpped warmup queries")
+        
+        limit = len(query_ids) if query_limit == sys.maxsize else min(len(query_ids), query_limit)
+        '''for i in range(0, limit):
             q = queries[i]
 
             search_params = {}
@@ -364,7 +385,7 @@ class RetrievalOpenSearch:
             query_response = self.opensearch.search(index=index_name,
                                                     body=get_body_vector(get_doc_text(q)),
                                                     params=search_params)
-            logger.info(query_response)
+            #logger.info(query_response)
             query_responses.append(query_response)
             if i % 50 == 0:
                 print("Executed queries: " + str(i))
@@ -380,5 +401,28 @@ class RetrievalOpenSearch:
                 if corp_id != query_id:
                     self.results[query_id][corp_id] = hit['_score']
             self.took_time[query_id] = int(query_responses[i]['took'])
+
+        return self.results'''
+        for i in range(0, limit):
+            q = queries[i]
+            query_id = query_ids[i]
+
+            search_params = {}
+            if self.search_method == 'hybrid':
+                search_params["search_pipeline"] = self.pipeline_name
+            
+            query_response = self.opensearch.search(index=index_name,
+                                                    body=get_body_vector(get_doc_text(q)),
+                                                    params=search_params)
+            
+            for hit in query_response['hits']['hits']:
+                corp_id = hit['_id']
+                if corp_id != query_id:
+                    self.results[query_id][corp_id] = hit['_score']
+            
+            self.took_time[query_id] = int(query_response['took'])
+
+            if i % 50 == 0:
+                print("Executed queries: " + str(i))
 
         return self.results
