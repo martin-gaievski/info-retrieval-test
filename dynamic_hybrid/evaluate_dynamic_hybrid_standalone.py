@@ -218,20 +218,20 @@ class DynamicHybridSearchEvaluator:
         # Build hybrid query - handle ESCI field names
         if hasattr(self, 'dataset_name') and self.dataset_name.lower() == "esci":
             # ESCI uses different field names
-            text_field = "text_key"
+            #text_field = "text_key"
             embedding_field = "title_embedding"
             text_query = {
                 "multi_match": {
                     "query": query,
                     "type": "best_fields",
-                    "fields": [text_field, "title_key"],
-                    "tie_breaker": 0.5
+                    "operator": "and",
+                    "fields": ["product_id^100", "product_bullet_point^3", "product_color^2", "product_brand^5", "product_title^10", "product_description"]
                 }
             }
         else:
             # Standard BEIR field names
             text_field = "passage_text"
-            embedding_field = "passage_embedding"
+            embedding_field = "title_embedding"
             text_query = {
                 "match": {
                     text_field: {

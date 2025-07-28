@@ -43,6 +43,7 @@ if [ -n "$DATASET_NAME" ]; then
 fi
 echo ""
 
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -114,11 +115,7 @@ else
             "type": "text",
             "analyzer": "standard"
           },
-          "passage_text": {
-            "type": "text",
-            "analyzer": "standard"
-          },
-          "passage_embedding": {
+          "title_embedding": {
             "type": "knn_vector",
             "dimension": 384,
             "method": {
@@ -131,13 +128,7 @@ else
               }
             }
           },
-          "title": {
-            "type": "text"
-          },
-          "title_key": {
-            "type": "text"
-          },
-          "text_key": {
+          "product_title": {
             "type": "text"
           }
         }
@@ -291,7 +282,7 @@ curl -s -X PUT "http://localhost:9200/_ingest/pipeline/embeddings-pipeline" \
           \"text_embedding\": {
           \"model_id\": \"$model_id\",
           \"field_map\": {
-            \"passage_text\": \"passage_embedding\"
+            \"product_title\": \"title_embedding\"
           }
         }
       }
@@ -321,7 +312,7 @@ if [ -n "$model_id" ]; then
         \"hybrid\": {
           \"queries\": [
             {\"match\": {\"passage_text\": \"test\"}},
-            {\"neural\": {\"passage_embedding\": {\"query_text\": \"test\", \"model_id\": \"$model_id\", \"k\": 1}}}
+            {\"neural\": {\"title_embedding\": {\"query_text\": \"test\", \"model_id\": \"$model_id\", \"k\": 1}}}
           ]
         }
       }

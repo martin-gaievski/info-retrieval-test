@@ -52,6 +52,36 @@ python -m beir.hybrid.data_ingestor \
 # Note the model_id from output (looks like: pCEwOZgBtmNHHhH7ZtEE)
 ```
 
+## 4b. Alternative: Quick Test with ESCI Dataset
+
+ESCI (e-commerce) is ideal for testing product search scenarios:
+
+```bash
+# Create data directory
+mkdir -p esci_data
+
+# Download ESCI sample data manually from:
+# - Products: https://esci-data.s3.amazonaws.com/esci-data/shopping_queries_dataset_products_us_small.parquet
+# - Examples: https://esci-data.s3.amazonaws.com/esci-data/shopping_queries_dataset_examples_us_small.parquet
+
+# If on remote server, copy downloaded files:
+# scp /local/path/*.parquet remote-host:/path/to/project/esci_data/
+
+# Setup OpenSearch and get model_id
+./setup_opensearch_for_poc.sh
+
+# Ingest ESCI data using our optimized script
+python esci_ingestion.py -m YOUR_MODEL_ID -d esci_data
+
+# The script will test search functionality automatically
+```
+
+**Why use ESCI?**
+- Real e-commerce product data (~1K products)
+- Realistic search queries and relevance judgments
+- Demonstrates hybrid search for product catalogs
+- Faster than SciFact for quick testing
+
 ## 5. Run Evaluation
 
 ```bash

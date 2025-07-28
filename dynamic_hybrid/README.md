@@ -39,7 +39,7 @@ pip install -r dynamic_hybrid/requirements.txt
 
 ### 3. Ingest Data and Create Neural Model
 
-Example with FiQA dataset:
+#### Standard BEIR Datasets (FiQA, SciFact, etc.)
 ```bash
 # Download and ingest dataset
 python -m beir.hybrid.data_ingestor \
@@ -49,6 +49,32 @@ python -m beir.hybrid.data_ingestor \
 
 # Note the model_id from output for next steps
 ```
+
+#### ESCI Dataset (E-commerce Products)
+For ESCI dataset, use our optimized ingestion script:
+
+```bash
+# Download ESCI sample data
+mkdir -p esci_data
+cd esci_data
+wget https://esci-data.s3.amazonaws.com/esci-data/shopping_queries_dataset_products_us_small.parquet
+wget https://esci-data.s3.amazonaws.com/esci-data/shopping_queries_dataset_examples_us_small.parquet
+cd ..
+
+# Ingest using optimized ESCI script
+python dynamic_hybrid/esci_ingestion.py -m <YOUR_MODEL_ID> -d esci_data
+
+# For full dataset (100K+ products)
+python dynamic_hybrid/esci_ingestion.py -m <YOUR_MODEL_ID> -d esci_data --full-dataset
+```
+
+**Why use the ESCI script?**
+- Proper field mapping for e-commerce data (`product_title` → `title_embedding`)
+- Handles parquet files natively
+- Built-in search functionality testing
+- Optimized for product catalog ingestion
+
+See `ESCI_SETUP.md` for detailed ESCI setup instructions.
 
 ### 4. Train Weight Predictor
 

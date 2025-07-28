@@ -118,9 +118,10 @@ class DataLoader:
             brand = row.get('product_brand', '')
             color = row.get('product_color', '')
             description = row.get('product_description', '')
+            bullet_points = row.get('product_bullet_points', '')
             
             # Build text representation
-            text_parts = []
+            '''text_parts = []
             if title:
                 text_parts.append(title)
             if brand and brand != 'null':
@@ -130,18 +131,17 @@ class DataLoader:
             if description and len(description) > 10:  # Skip very short descriptions
                 text_parts.append(description)
             
-            text = " ".join(text_parts)
+            text = " ".join(text_parts)'''
             
             # Store in corpus with metadata
             self.corpus[product_id] = {
-                "text": text,
-                "title": title,
-                "metadata": {
-                    "product_id": product_id,
-                    "brand": brand,
-                    "color": color,
-                    "locale": row.get('product_locale', self.language)
-                }
+                "product_title": title,
+                "product_id": product_id,
+                "product_brand": brand,
+                "product_color": color,
+                "product_description": description,
+                "product_locale": row.get('product_locale', self.language),
+                "product_bullet_points": bullet_points
             }
     
     def _load_queries_and_qrels(self, split: str):

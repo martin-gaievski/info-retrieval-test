@@ -81,7 +81,8 @@ class WeightPredictorTrainer:
                             dataset_name: str,
                             data_path: str,
                             weight_grid: List[Tuple[float, float]],
-                            sample_size: Optional[int] = None) -> pd.DataFrame:
+                            sample_size: Optional[int] = None,
+                            use_full_dataset: bool = False) -> pd.DataFrame:
         """
         Collect training data by evaluating queries with different weights.
         
@@ -101,7 +102,7 @@ class WeightPredictorTrainer:
             loader = ESCIDataLoader(
                 data_folder=data_path,
                 language="us",
-                small_version=True
+                small_version=not use_full_dataset
             )
             corpus, queries, qrels = loader.load(split="test")
         else:
@@ -196,23 +197,23 @@ class WeightPredictorTrainer:
         """Run hybrid search with specified weights"""
         # Build hybrid query - handle ESCI field names
         if dataset_name and dataset_name.lower() == "esci":
-            # ESCI uses different field names
-            text_field = "text_key"
-            embedding_field = "title_embedding"  # ML pipeline maps title_key to title_embedding
+            # ESCI uses different field names (match the ingestion script)
+            text_field = "product_title"
+            embedding_field = "title_embedding"  # ML pipeline maps product_title to title_embedding
             text_query = {
                 "multi_match": {
                     "query": query,
                     "type": "best_fields",
-                    "fields": [text_field, "title_key"],
-                    "tie_breaker": 0.5
+                    "operator": "and",
+                    "fields": ["product_id^100", "product_bullet_point^3", "product_color^2", "product_brand^5", "product_title^10", "product_description"]
                 }
             }
         else:
             # Standard BEIR field names
-            text_field = "passage_text"
-            embedding_field = "passage_embedding"
+            text_field = "product_title"
+            embedding_field = "title_embedding"
             text_query = {
-                "match": {
+                "multi_match": {
                     text_field: {
                         "query": query
                     }
@@ -433,7 +434,9 @@ class WeightPredictorTrainer:
 def main():
     parser = argparse.ArgumentParser(description='Train weight predictor for dynamic hybrid search')
     parser.add_argument('-d', '--dataset', required=True, help='Dataset name')
-    parser.add_argument('-u', '--url', required=True, help='Dataset URL')
+    parser.add_argument('-u', '--url', required=True, help='Dataset URL (use "local" for ESCI)')
+    parser.add_argument('--data-path', default=None, help='Path to ESCI parquet files (for ESCI dataset)')
+    parser.add_argument('--full-dataset', action='store_true', help='Use full ESCI dataset instead of small version')
     parser.add_argument('--host', default='localhost', help='OpenSearch host')
     parser.add_argument('-p', '--port', type=int, default=9200, help='OpenSearch port')
     parser.add_argument('-i', '--index', required=True, help='Index name')
@@ -464,15 +467,26 @@ def main():
     else:
         # Handle dataset loading - ESCI is special case
         if args.dataset.lower() == "esci":
-            # ESCI uses local data
-            data_path = os.path.join(os.getcwd(), "dynamic_hybrid", "datasets", "esci")
-            logger.info(f"Using local ESCI data from {data_path}")
+            # ESCI uses local data - use custom path if provided
+            if args.data_path:
+                data_path = args.data_path
+                logger.info(f"Using ESCI data from custom path: {data_path}")
+            else:
+                data_path = os.path.join(os.getcwd(), "dynamic_hybrid", "datasets", "esci")
+                logger.info(f"Using default ESCI data path: {data_path}")
             
             # Check if data exists
             if not os.path.exists(data_path):
                 logger.error(f"ESCI data not found at {data_path}")
-                logger.error("Please run the ESCI setup script first:")
-                logger.error(f"python dynamic_hybrid/test_esci_fixed.py -d esci -o ingest")
+                if args.data_path:
+                    logger.error("Please check the --data-path parameter points to a folder containing:")
+                    logger.error("  - shopping_queries_dataset_products_us_small.parquet")
+                    logger.error("  - shopping_queries_dataset_examples_us_small.parquet")
+                else:
+                    logger.error("Please either:")
+                    logger.error("1. Use --data-path to specify your ESCI data folder, or")
+                    logger.error("2. Run the ESCI setup script first:")
+                    logger.error("   python dynamic_hybrid/esci_ingestion.py -m MODEL_ID -d esci_data")
                 sys.exit(1)
         else:
             # Download regular BEIR dataset
@@ -491,7 +505,8 @@ def main():
             args.dataset,
             data_path,
             weight_grid,
-            sample_size=args.sample_size
+            sample_size=args.sample_size,
+            use_full_dataset=args.full_dataset
         )
         
         # Save training data if requested
