@@ -1,6 +1,6 @@
 """
 Evaluate dynamic hybrid search on BEIR datasets.
-Clean version for public repository.
+Fixed version for ESCI with correct field names.
 """
 
 import os
@@ -12,7 +12,7 @@ from typing import Dict, List, Tuple, Optional
 from collections import defaultdict
 import numpy as np
 
-# Add current directory to path for imports
+# Add dynamic_hybrid to path for imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # BEIR imports
@@ -20,22 +20,17 @@ from beir import util, LoggingHandler
 from beir.datasets.data_loader import GenericDataLoader
 from beir.retrieval.evaluation import EvaluateRetrieval
 
-# Special handling for ESCI - requires additional module
+# Add the beir path to import the ESCI data loader
+import os
+import sys
+beir_path = os.path.join(os.path.dirname(__file__), '..', 'beir')
+sys.path.insert(0, beir_path)
+
 try:
     from beir.datasets.data_loader_esci import DataLoader as ESCIDataLoader
-    ESCI_AVAILABLE = True
 except ImportError:
-    # Try alternative import path
-    try:
-        import sys
-        import os
-        beir_path = os.path.join(os.path.dirname(__file__), '..', 'beir')
-        sys.path.insert(0, beir_path)
-        from datasets.data_loader_esci import DataLoader as ESCIDataLoader
-        ESCI_AVAILABLE = True
-    except ImportError:
-        ESCI_AVAILABLE = False
-        print("Warning: ESCI DataLoader not available. Install from: https://github.com/beir-cellar/beir")
+    # Fallback to the local version
+    from datasets.data_loader_esci import DataLoader as ESCIDataLoader
 
 # OpenSearch imports
 from opensearchpy import OpenSearch
@@ -60,8 +55,7 @@ class DynamicHybridSearchEvaluator:
                  port: int = 9200,
                  index_name: str = "beir-index",
                  model_id: str = None,
-                 use_ml_predictor: bool = False,
-                 model_path: Optional[str] = None):
+                 use_ml_predictor: bool = False):
         """
         Initialize evaluator.
         
@@ -71,7 +65,6 @@ class DynamicHybridSearchEvaluator:
             index_name: Name of the index
             model_id: Neural model ID for semantic search
             use_ml_predictor: Whether to use ML-based weight prediction
-            model_path: Path to weight predictor model file
         """
         self.client = OpenSearch(
             hosts=[{'host': host, 'port': port}],
@@ -86,7 +79,6 @@ class DynamicHybridSearchEvaluator:
         self.index_name = index_name
         self.model_id = model_id
         self.use_ml_predictor = use_ml_predictor
-        self.model_path = model_path
         
         # Results storage
         self.query_weights = {}
@@ -114,8 +106,6 @@ class DynamicHybridSearchEvaluator:
         
         # Load dataset - handle ESCI as special case
         if dataset_name.lower() == "esci":
-            if not ESCI_AVAILABLE:
-                raise ImportError("ESCI dataset requires special loader. See DEPENDENCIES.md")
             loader = ESCIDataLoader(
                 data_folder=data_path,
                 language="us",
@@ -128,7 +118,7 @@ class DynamicHybridSearchEvaluator:
         # Get domain and initialize components
         domain = get_domain_for_dataset(dataset_name)
         feature_extractor = DomainAwareFeatureExtractor(domain)
-        weight_predictor = get_predictor_for_dataset(dataset_name, self.use_ml_predictor, self.model_path)
+        weight_predictor = get_predictor_for_dataset(dataset_name, self.use_ml_predictor)
         
         logger.info(f"Dataset domain: {domain.value}")
         logger.info(f"Total queries in dataset: {len(queries)}")
@@ -229,28 +219,26 @@ class DynamicHybridSearchEvaluator:
         """
         # Build hybrid query - handle ESCI field names
         if hasattr(self, 'dataset_name') and self.dataset_name.lower() == "esci":
-            # ESCI uses different field names
-            #text_field = "text_key"
-            embedding_field = "title_embedding"
+            # ESCI uses ACTUAL field names from CreateIndex.json
             text_query = {
                 "multi_match": {
                     "query": query,
                     "type": "best_fields",
-                    "operator": "and",
-                    "fields": ["product_id^100", "product_bullet_point^3", "product_color^2", "product_brand^5", "product_title^10", "product_description"]
+                    "fields": ["title", "description", "bullets"],
+                    "tie_breaker": 0.5
                 }
             }
+            embedding_field = "title_embedding"
         else:
             # Standard BEIR field names
-            text_field = "passage_text"
-            embedding_field = "title_embedding"
             text_query = {
                 "match": {
-                    text_field: {
+                    "passage_text": {
                         "query": query
                     }
                 }
             }
+            embedding_field = "passage_embedding"
         
         hybrid_query = {
             "_source": False,
@@ -272,12 +260,11 @@ class DynamicHybridSearchEvaluator:
                 }
             },
             "search_pipeline": {
-                "description": "Dynamic post processor for hybrid search",
                 "phase_results_processors": [
                     {
                         "normalization-processor": {
                             "normalization": {
-                                "technique": "min_max"
+                                "technique": "l2"
                             },
                             "combination": {
                                 "technique": "arithmetic_mean",
@@ -291,7 +278,17 @@ class DynamicHybridSearchEvaluator:
             }
         }
         
-        # Execute search with dynamic inline pipeline
+        # Log query for debugging
+        if hasattr(self, '_debug_count'):
+            self._debug_count += 1
+        else:
+            self._debug_count = 1
+        
+        if self._debug_count <= 3:
+            logger.info(f"Query {self._debug_count} weights: lexical={lexical_weight}, neural={neural_weight}")
+            logger.info(f"Hybrid query structure: {json.dumps(hybrid_query, indent=2)}")
+        
+        # Execute search directly (weights are now in the query)
         try:
             response = self.client.search(
                 index=self.index_name,
@@ -309,7 +306,6 @@ class DynamicHybridSearchEvaluator:
             
         except Exception as e:
             logger.error(f"Search failed for query: {query[:50]}... Error: {e}")
-            logger.error(f"Query was: {json.dumps(hybrid_query, indent=2)}")
             return {}
     
     def compare_static_vs_dynamic(self,
@@ -423,13 +419,9 @@ def main():
     parser.add_argument('-m', '--model-id', required=True, help='Neural model ID')
     parser.add_argument('-o', '--output', required=True, help='Output file for results')
     parser.add_argument('--compare', action='store_true', help='Compare with static weights')
-    parser.add_argument('--static-weights', nargs='+', default=None,
-                       help='Static weight configurations (format: lex,neural). If not specified with --compare, tests all combinations.')
+    parser.add_argument('--static-weights', nargs='+', default=['0.5,0.5', '0.3,0.7', '0.7,0.3'],
+                       help='Static weight configurations (format: lex,neural)')
     parser.add_argument('--use-ml', action='store_true', help='Use ML predictor instead of heuristics')
-    parser.add_argument('--weight-predictor-model', type=str, default=None,
-                       help='Path to weight predictor model file (e.g., esci_weight_predictor_linear.pkl)')
-    parser.add_argument('--weight-step', type=float, default=0.1,
-                       help='Step size for weight grid when testing all combinations (default: 0.1)')
     parser.add_argument('-q', '--max-queries', type=int, default=None, 
                        help='Maximum number of queries to evaluate (default: all)')
     
@@ -437,18 +429,15 @@ def main():
     
     # Handle dataset loading - ESCI is special case
     if args.dataset.lower() == "esci":
-        # ESCI uses local data - check both possible locations
-        data_path = os.path.join(os.getcwd(), "esci_data")
-        if not os.path.exists(data_path):
-            # Try alternative location
-            data_path = os.path.join(os.getcwd(), "datasets", "esci")
-        
+        # ESCI uses local data
+        data_path = os.path.join(os.getcwd(), "dynamic_hybrid", "datasets", "esci")
         logger.info(f"Using local ESCI data from {data_path}")
         
         # Check if data exists
         if not os.path.exists(data_path):
             logger.error(f"ESCI data not found at {data_path}")
-            logger.error("Please ensure ESCI data exists in either 'esci_data' or 'datasets/esci' folder")
+            logger.error("Please run the ESCI setup script first:")
+            logger.error("python dynamic_hybrid/test_esci_fixed.py -d esci -o ingest")
             sys.exit(1)
     else:
         # Download regular BEIR dataset
@@ -462,8 +451,7 @@ def main():
         port=args.port,
         index_name=args.index,
         model_id=args.model_id,
-        use_ml_predictor=args.use_ml,
-        model_path=args.weight_predictor_model
+        use_ml_predictor=args.use_ml
     )
     
     # Store dataset name for search field mapping
@@ -473,22 +461,9 @@ def main():
     if args.compare:
         # Parse static weights
         static_weights = []
-        if args.static_weights:
-            # Use provided weights
-            for weight_str in args.static_weights:
-                lex, neural = map(float, weight_str.split(','))
-                static_weights.append((lex, neural))
-        else:
-            # Generate all combinations with given step
-            logger.info(f"Generating all weight combinations with step {args.weight_step}")
-            for lex in np.arange(args.weight_step, 1.0, args.weight_step):
-                neural = round(1.0 - lex, 2)  # Round to avoid floating point issues
-                lex = round(lex, 2)
-                static_weights.append((lex, neural))
-            # Add the edge cases
-            static_weights.append((0.1, 0.9))
-            static_weights.append((0.9, 0.1))
-            logger.info(f"Testing {len(static_weights)} weight combinations")
+        for weight_str in args.static_weights:
+            lex, neural = map(float, weight_str.split(','))
+            static_weights.append((lex, neural))
         
         results = evaluator.compare_static_vs_dynamic(
             args.dataset,
@@ -507,9 +482,6 @@ def main():
     results["query_analysis"] = evaluator.analyze_query_performance()
     
     # Save results
-    output_dir = os.path.dirname(args.output)
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
     with open(args.output, 'w') as f:
         json.dump(results, f, indent=2)
     

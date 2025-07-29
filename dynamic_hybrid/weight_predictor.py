@@ -289,14 +289,29 @@ def get_predictor_for_dataset(dataset_name: str, use_ml: bool = False, model_pat
         WeightPredictor instance
     """
     from feature_extractor import get_domain_for_dataset
+    import os
     
     domain = get_domain_for_dataset(dataset_name)
     
-    if use_ml and model_path:
-        return MLWeightPredictor(model_path=model_path, domain=domain)
-    elif use_ml:
-        # Try to find default model path
-        default_path = f"{dataset_name}_weight_predictor_model.pkl"
-        return MLWeightPredictor(model_path=default_path, domain=domain)
+    if use_ml:
+        # Check if model_path was provided via command line
+        if model_path and os.path.exists(model_path):
+            print(f"Using ML model from: {model_path}")
+            return MLWeightPredictor(model_path=model_path, domain=domain)
+        else:
+            # Try default paths
+            default_paths = [
+                f"{dataset_name}_weight_predictor_model_enhanced.pkl",
+                f"{dataset_name}_weight_predictor_model.pkl",
+                f"{dataset_name.lower()}_weight_predictor_model_enhanced.pkl",
+                f"{dataset_name.lower()}_weight_predictor_model.pkl"
+            ]
+            for path in default_paths:
+                if os.path.exists(path):
+                    print(f"Found ML model at: {path}")
+                    return MLWeightPredictor(model_path=path, domain=domain)
+            
+            print(f"No ML model found, falling back to heuristics")
+            return DomainAwareWeightPredictor(domain=domain)
     else:
         return DomainAwareWeightPredictor(domain=domain)
