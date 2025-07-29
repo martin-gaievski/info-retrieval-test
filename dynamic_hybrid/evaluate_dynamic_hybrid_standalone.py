@@ -97,7 +97,10 @@ class DynamicHybridSearchEvaluator:
                         data_path: str,
                         static_weights: Optional[Tuple[float, float]] = None,
                         k_values: List[int] = [1, 3, 5, 10, 100, 1000],
-                        max_queries: Optional[int] = None) -> Dict:
+                        max_queries: Optional[int] = None,
+                        corpus: Optional[Dict] = None,
+                        queries: Optional[Dict] = None,
+                        qrels: Optional[Dict] = None) -> Dict:
         """
         Evaluate on a BEIR dataset with dynamic or static weights.
         
@@ -106,24 +109,32 @@ class DynamicHybridSearchEvaluator:
             data_path: Path to dataset files
             static_weights: If provided, use static weights instead of dynamic
             k_values: k values for metrics
+            max_queries: Maximum number of queries to evaluate
+            corpus: Pre-loaded corpus (optional, to avoid reloading)
+            queries: Pre-loaded queries (optional, to avoid reloading)
+            qrels: Pre-loaded qrels (optional, to avoid reloading)
             
         Returns:
             Dictionary containing evaluation results
         """
-        logger.info(f"Loading dataset: {dataset_name}")
-        
-        # Load dataset - handle ESCI as special case
-        if dataset_name.lower() == "esci":
-            if not ESCI_AVAILABLE:
-                raise ImportError("ESCI dataset requires special loader. See DEPENDENCIES.md")
-            loader = ESCIDataLoader(
-                data_folder=data_path,
-                language="us",
-                small_version=True
-            )
-            corpus, queries, qrels = loader.load(split="test")
+        # Load dataset if not provided
+        if corpus is None or queries is None or qrels is None:
+            logger.info(f"Loading dataset: {dataset_name}")
+            
+            # Load dataset - handle ESCI as special case
+            if dataset_name.lower() == "esci":
+                if not ESCI_AVAILABLE:
+                    raise ImportError("ESCI dataset requires special loader. See DEPENDENCIES.md")
+                loader = ESCIDataLoader(
+                    data_folder=data_path,
+                    language="us",
+                    small_version=True
+                )
+                corpus, queries, qrels = loader.load(split="test")
+            else:
+                corpus, queries, qrels = GenericDataLoader(data_folder=data_path).load(split="test")
         else:
-            corpus, queries, qrels = GenericDataLoader(data_folder=data_path).load(split="test")
+            logger.info(f"Using pre-loaded dataset: {dataset_name}")
         
         # Get domain and initialize components
         domain = get_domain_for_dataset(dataset_name)
@@ -335,10 +346,33 @@ class DynamicHybridSearchEvaluator:
             "comparisons": []
         }
         
+        # Load dataset once at the beginning
+        logger.info(f"Loading dataset once for all comparisons: {dataset_name}")
+        
+        if dataset_name.lower() == "esci":
+            if not ESCI_AVAILABLE:
+                raise ImportError("ESCI dataset requires special loader. See DEPENDENCIES.md")
+            loader = ESCIDataLoader(
+                data_folder=data_path,
+                language="us",
+                small_version=True
+            )
+            corpus, queries, qrels = loader.load(split="test")
+        else:
+            corpus, queries, qrels = GenericDataLoader(data_folder=data_path).load(split="test")
+        
+        logger.info(f"Dataset loaded. Corpus size: {len(corpus)}, Queries: {len(queries)}")
+        
         # Evaluate with dynamic weights
         logger.info("Evaluating with dynamic weights...")
         dynamic_results = self.evaluate_dataset(
-            dataset_name, data_path, static_weights=None, k_values=k_values, max_queries=max_queries
+            dataset_name, data_path, 
+            static_weights=None, 
+            k_values=k_values, 
+            max_queries=max_queries,
+            corpus=corpus,
+            queries=queries,
+            qrels=qrels
         )
         
         results["dynamic"] = dynamic_results
@@ -352,7 +386,10 @@ class DynamicHybridSearchEvaluator:
                 data_path, 
                 static_weights=(lex_weight, neural_weight),
                 k_values=k_values,
-                max_queries=max_queries
+                max_queries=max_queries,
+                corpus=corpus,
+                queries=queries,
+                qrels=qrels
             )
             
             # Calculate improvements
