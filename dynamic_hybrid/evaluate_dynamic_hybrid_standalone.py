@@ -99,7 +99,7 @@ class DynamicHybridSearchEvaluator:
                         dataset_name: str,
                         data_path: str,
                         static_weights: Optional[Tuple[float, float]] = None,
-                        k_values: List[int] = [1, 3, 5, 10, 100, 1000],
+                        k_values: List[int] = [1, 5, 10, 25, 50, 100],
                         max_queries: Optional[int] = None,
                         corpus: Optional[Dict] = None,
                         queries: Optional[Dict] = None,
@@ -219,7 +219,7 @@ class DynamicHybridSearchEvaluator:
             "random_seed": self.random_seed if max_queries is not None else None
         }
         
-        # Add average metrics
+        # Add average metrics for @10 (backward compatibility)
         evaluation_results["average_metrics"] = {
             "ndcg@10": ndcg.get("NDCG@10", 0.0),
             "map@10": _map.get("MAP@10", 0.0),
@@ -227,7 +227,80 @@ class DynamicHybridSearchEvaluator:
             "precision@10": precision.get("P@10", 0.0)
         }
         
+        # Add mean and median across all k values
+        evaluation_results["aggregated_metrics"] = self._calculate_aggregated_metrics(
+            ndcg, _map, recall, precision, k_values
+        )
+        
         return evaluation_results
+    
+    def _calculate_aggregated_metrics(self, ndcg: Dict, _map: Dict, 
+                                    recall: Dict, precision: Dict, 
+                                    k_values: List[int]) -> Dict:
+        """
+        Calculate mean and median for each metric across all k values.
+        
+        Args:
+            ndcg: NDCG scores for different k values
+            _map: MAP scores for different k values
+            recall: Recall scores for different k values
+            precision: Precision scores for different k values
+            k_values: List of k values used
+            
+        Returns:
+            Dictionary with mean and median for each metric
+        """
+        aggregated = {}
+        
+        # Process each metric type
+        metric_data = {
+            "ndcg": ndcg,
+            "map": _map,
+            "recall": recall,
+            "precision": precision
+        }
+        
+        for metric_name, metric_dict in metric_data.items():
+            values = []
+            for k in k_values:
+                # Get the metric value for this k - handle different key formats
+                if metric_name == "ndcg":
+                    key = f"NDCG@{k}"
+                elif metric_name == "map":
+                    key = f"MAP@{k}"
+                elif metric_name == "recall":
+                    key = f"Recall@{k}"  # Note: mixed case
+                elif metric_name == "precision":
+                    key = f"P@{k}"  # Note: uses "P" instead of "Precision"
+                
+                if key in metric_dict:
+                    values.append(metric_dict[key])
+            
+            if values:
+                aggregated[f"{metric_name}_mean"] = np.mean(values)
+                aggregated[f"{metric_name}_median"] = np.median(values)
+                aggregated[f"{metric_name}_std"] = np.std(values)
+                aggregated[f"{metric_name}_min"] = np.min(values)
+                aggregated[f"{metric_name}_max"] = np.max(values)
+            else:
+                # If no values found, set to 0
+                aggregated[f"{metric_name}_mean"] = 0.0
+                aggregated[f"{metric_name}_median"] = 0.0
+                aggregated[f"{metric_name}_std"] = 0.0
+                aggregated[f"{metric_name}_min"] = 0.0
+                aggregated[f"{metric_name}_max"] = 0.0
+        
+        # Also include per-k-value breakdown for transparency
+        aggregated["per_k_metrics"] = {}
+        for k in k_values:
+            aggregated["per_k_metrics"][f"@{k}"] = {
+                "ndcg": ndcg.get(f"NDCG@{k}", 0.0),
+                "map": _map.get(f"MAP@{k}", 0.0),
+                "recall": recall.get(f"Recall@{k}", 0.0),
+                "precision": precision.get(f"P@{k}", 0.0)
+            }
+        
+        return aggregated
     
     def _run_hybrid_search(self, 
                           query: str, 
@@ -335,7 +408,7 @@ class DynamicHybridSearchEvaluator:
                                  dataset_name: str,
                                  data_path: str,
                                  static_weights: List[Tuple[float, float]],
-                                 k_values: List[int] = [10],
+                                 k_values: List[int] = [1, 5, 10, 25, 50, 100],
                                  max_queries: Optional[int] = None) -> Dict:
         """
         Compare static and dynamic weight approaches.
@@ -413,7 +486,7 @@ class DynamicHybridSearchEvaluator:
                 qrels=qrels
             )
             
-            # Calculate improvements
+            # Calculate improvements for @10 metrics (backward compatibility)
             improvements = {}
             for metric in ["ndcg@10", "map@10", "recall@10", "precision@10"]:
                 dynamic_val = dynamic_results["average_metrics"][metric]
@@ -425,10 +498,25 @@ class DynamicHybridSearchEvaluator:
                     "improvement_pct": improvement
                 }
             
+            # Calculate improvements for aggregated metrics (mean/median)
+            aggregated_improvements = {}
+            for metric in ["ndcg", "map", "recall", "precision"]:
+                for stat in ["mean", "median"]:
+                    key = f"{metric}_{stat}"
+                    dynamic_val = dynamic_results["aggregated_metrics"][key]
+                    static_val = static_results["aggregated_metrics"][key]
+                    improvement = ((dynamic_val - static_val) / static_val * 100) if static_val > 0 else 0
+                    aggregated_improvements[key] = {
+                        "dynamic": dynamic_val,
+                        "static": static_val,
+                        "improvement_pct": improvement
+                    }
+            
             results["comparisons"].append({
                 "static_weights": f"{lex_weight}/{neural_weight}",
                 "static_results": static_results,
-                "improvements": improvements
+                "improvements": improvements,
+                "aggregated_improvements": aggregated_improvements
             })
         
         return results
@@ -581,10 +669,38 @@ def main():
         print("\n=== Comparison Summary ===")
         if args.max_queries:
             print(f"Random seed used for query selection: {args.seed}")
+        
+        # Print dynamic results first
+        print("\n--- Dynamic Weight Results ---")
+        print(f"Primary Metrics:")
+        print(f"  NDCG@10: {results['dynamic']['average_metrics']['ndcg@10']:.4f}")
+        print(f"  Mean NDCG: {results['dynamic']['aggregated_metrics']['ndcg_mean']:.4f}")
+        print(f"  Median NDCG: {results['dynamic']['aggregated_metrics']['ndcg_median']:.4f}")
+        print(f"\nAll Metrics Summary (Mean/Median):")
+        for metric in ['ndcg', 'map', 'recall', 'precision']:
+            mean_val = results['dynamic']['aggregated_metrics'][f'{metric}_mean']
+            median_val = results['dynamic']['aggregated_metrics'][f'{metric}_median']
+            print(f"  {metric.upper()}: mean={mean_val:.4f}, median={median_val:.4f}")
+        
+        # Print comparisons
+        print("\n--- Static vs Dynamic Comparisons ---")
         for comp in results["comparisons"]:
             print(f"\nStatic weights: {comp['static_weights']}")
+            
+            # Primary metrics comparison
+            ndcg10_imp = comp['improvements']['ndcg@10']['improvement_pct']
+            ndcg_mean_imp = comp['aggregated_improvements']['ndcg_mean']['improvement_pct']
+            ndcg_median_imp = comp['aggregated_improvements']['ndcg_median']['improvement_pct']
+            
+            print(f"  Primary Metrics Improvement:")
+            print(f"    NDCG@10: {ndcg10_imp:+.1f}%")
+            print(f"    Mean NDCG: {ndcg_mean_imp:+.1f}%")
+            print(f"    Median NDCG: {ndcg_median_imp:+.1f}%")
+            
+            # Show all @10 metrics for backward compatibility
+            print(f"  All @10 Metrics:")
             for metric, data in comp["improvements"].items():
-                print(f"  {metric}: {data['dynamic']:.4f} vs {data['static']:.4f} "
+                print(f"    {metric}: {data['dynamic']:.4f} vs {data['static']:.4f} "
                       f"({data['improvement_pct']:+.1f}%)")
     else:
         print("\n=== Evaluation Summary ===")
@@ -593,7 +709,23 @@ def main():
         print(f"Number of queries: {results['num_queries']}")
         if args.max_queries:
             print(f"Random seed used for query selection: {args.seed}")
-        print("\nAverage metrics:")
+        
+        # Primary metrics
+        print("\nPrimary Metrics:")
+        print(f"  NDCG@10: {results['average_metrics']['ndcg@10']:.4f}")
+        print(f"  Mean NDCG: {results['aggregated_metrics']['ndcg_mean']:.4f}")
+        print(f"  Median NDCG: {results['aggregated_metrics']['ndcg_median']:.4f}")
+        
+        # All metrics summary
+        print("\nAll Metrics Summary (Mean/Median/Std):")
+        for metric in ['ndcg', 'map', 'recall', 'precision']:
+            mean_val = results['aggregated_metrics'][f'{metric}_mean']
+            median_val = results['aggregated_metrics'][f'{metric}_median']
+            std_val = results['aggregated_metrics'][f'{metric}_std']
+            print(f"  {metric.upper()}: mean={mean_val:.4f}, median={median_val:.4f}, std={std_val:.4f}")
+        
+        # Traditional @10 metrics for backward compatibility
+        print("\nTraditional @10 metrics:")
         for metric, value in results['average_metrics'].items():
             print(f"  {metric}: {value:.4f}")
 

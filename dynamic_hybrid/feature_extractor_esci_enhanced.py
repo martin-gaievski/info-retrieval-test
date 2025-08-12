@@ -70,15 +70,8 @@ class ESCIEnhancedFeatureExtractor(DomainAwareFeatureExtractor):
         self.spec_regex = re.compile('|'.join(self.SPECIFICATION_PATTERNS), re.IGNORECASE)
     
     def extract_features(self, query_text: str) -> Dict[str, float]:
-        """Extract enhanced features for ESCI queries"""
-        # Start with basic features (manually extract to avoid parent conflict)
+        """Extract enhanced features for ESCI queries (extended features only)"""
         features = {}
-        
-        # Basic features
-        features['query_length'] = len(query_text)
-        features['token_count'] = len(query_text.split())
-        features['has_numbers'] = 1.0 if bool(re.search(r'\d', query_text)) else 0.0
-        features['has_special_chars'] = 1.0 if bool(re.search(r'[^a-zA-Z0-9\s]', query_text)) else 0.0
         
         # Add intent-based features
         search_features = self._extract_search_intent_features(query_text)

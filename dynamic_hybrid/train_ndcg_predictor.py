@@ -47,6 +47,10 @@ try:
     from feature_extractor_esci_enhanced import ESCIEnhancedFeatureExtractor
 except ImportError:
     ESCIEnhancedFeatureExtractor = None
+try:
+    from feature_extractor_esci_basic import ESCIBasicFeatureExtractor
+except ImportError:
+    ESCIBasicFeatureExtractor = None
 
 # Configure logging
 logging.basicConfig(format='%(asctime)s - %(message)s',
@@ -63,7 +67,9 @@ class NDCGPredictorTrainer:
                  host: str = "localhost",
                  port: int = 9200,
                  index_name: str = "beir-index",
-                 model_id: str = None):
+                 model_id: str = None,
+                 feature_complexity: str = "extended",
+                 random_seed: int = 42):
         """Initialize trainer"""
         self.client = OpenSearch(
             hosts=[{'host': host, 'port': port}],
@@ -78,6 +84,8 @@ class NDCGPredictorTrainer:
         self.index_name = index_name
         self.model_id = model_id
         self.training_data = []
+        self.feature_complexity = feature_complexity
+        self.random_seed = random_seed
         
     def collect_training_data(self,
                             dataset_name: str,
@@ -119,18 +127,43 @@ class NDCGPredictorTrainer:
         # Sample queries if requested
         if sample_size and sample_size < len(queries):
             query_ids = list(queries.keys())
+            # Set seed for reproducible sampling
+            np.random.seed(self.random_seed)
             np.random.shuffle(query_ids)
             query_ids = query_ids[:sample_size]
             queries = {qid: queries[qid] for qid in query_ids}
-            logger.info(f"Sampled {sample_size} queries for training")
+            logger.info(f"Sampled {sample_size} queries for training (seed: {self.random_seed})")
         
         # Initialize feature extractor
-        if dataset_name.lower() == "esci" and ESCIEnhancedFeatureExtractor:
-            feature_extractor = ESCIEnhancedFeatureExtractor()
-            logger.info("Using ESCIEnhancedFeatureExtractor")
+        if dataset_name.lower() == "esci":
+            if hasattr(self, 'feature_complexity'):
+                if self.feature_complexity == "basic":
+                    if ESCIBasicFeatureExtractor:
+                        feature_extractor = ESCIBasicFeatureExtractor()
+                        logger.info("Using ESCIBasicFeatureExtractor")
+                    else:
+                        raise ImportError("ESCIBasicFeatureExtractor not available")
+                elif self.feature_complexity == "extended":
+                    # For extended, we combine basic + enhanced features
+                    if ESCIBasicFeatureExtractor and ESCIEnhancedFeatureExtractor:
+                        feature_extractor = self._get_combined_feature_extractor()
+                        logger.info("Using combined ESCIBasicFeatureExtractor + ESCIEnhancedFeatureExtractor")
+                    else:
+                        raise ImportError("ESCIBasicFeatureExtractor or ESCIEnhancedFeatureExtractor not available")
+                else:
+                    raise ValueError(f"Invalid feature_complexity value: {self.feature_complexity}. Must be 'basic' or 'extended'")
+            else:
+                # Default to extended for backward compatibility
+                if ESCIEnhancedFeatureExtractor:
+                    feature_extractor = ESCIEnhancedFeatureExtractor()
+                    logger.info("Using ESCIEnhancedFeatureExtractor (default)")
+                else:
+                    raise ImportError("ESCIEnhancedFeatureExtractor not available")
         else:
-            domain = get_domain_for_dataset(dataset_name)
-            feature_extractor = DomainAwareFeatureExtractor(domain)
+            # domain = get_domain_for_dataset(dataset_name)
+            # feature_extractor = DomainAwareFeatureExtractor(domain)
+            raise ValueError("Domain aware features are turned off")
+            
             
         logger.info(f"Testing {len(weight_values)} weight values on {len(queries)} queries")
         logger.info(f"Total combinations: {len(weight_values) * len(queries)}")
@@ -284,6 +317,23 @@ class NDCGPredictorTrainer:
         except Exception as e:
             logger.error(f"Search failed: {e}")
             return {}
+    
+    def _get_combined_feature_extractor(self):
+        """Get a combined feature extractor that uses both basic and enhanced features"""
+        class CombinedFeatureExtractor:
+            def __init__(self):
+                self.basic_extractor = ESCIBasicFeatureExtractor()
+                self.enhanced_extractor = ESCIEnhancedFeatureExtractor()
+            
+            def extract_features(self, query: str) -> Dict[str, float]:
+                """Extract both basic and enhanced features"""
+                # Get basic features
+                features = self.basic_extractor.extract_features(query)
+                # Add enhanced features
+                features.update(self.enhanced_extractor.extract_features(query))
+                return features
+        
+        return CombinedFeatureExtractor()
     
     def _calculate_ndcg_at_k(self, results: Dict[str, float], 
                            relevant_docs: Dict[str, int], k: int = 10) -> float:
@@ -481,6 +531,11 @@ def main():
                        help='Save/load training data to/from this file')
     parser.add_argument('--include-result-features', action='store_true',
                        help='Include search result features in training')
+    parser.add_argument('--feature-complexity', choices=['basic', 'extended'],
+                       default='extended', 
+                       help='Feature complexity for ESCI dataset: "basic" (only query_length, token_count, has_numbers, has_special_chars) or "extended" (all features)')
+    parser.add_argument('--seed', type=int, default=42,
+                       help='Random seed for training query selection when using sample-size (default: 42)')
     
     args = parser.parse_args()
     
@@ -489,7 +544,9 @@ def main():
         host=args.host,
         port=args.port,
         index_name=args.index,
-        model_id=args.model_id
+        model_id=args.model_id,
+        feature_complexity=args.feature_complexity,
+        random_seed=args.seed
     )
     
     # Check if we have saved training data
