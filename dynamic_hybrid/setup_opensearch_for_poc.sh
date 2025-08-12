@@ -3,21 +3,34 @@
 
 # Parse command line arguments
 DATASET_NAME=""
+HOST="localhost"
+PORT="9200"
 while [[ $# -gt 0 ]]; do
     case $1 in
         -d|--dataset)
             DATASET_NAME="$2"
             shift 2
             ;;
+        -h|--host)
+            HOST="$2"
+            shift 2
+            ;;
+        -p|--port)
+            PORT="$2"
+            shift 2
+            ;;
         --help)
             echo "Usage: $0 [OPTIONS]"
             echo ""
             echo "Options:"
-            echo "  -d, --dataset DATASET    Dataset name (e.g., scifact, scidocs)"
+            echo "  -d, --dataset DATASET    Dataset name (e.g., scifact, scidocs, esci-product)"
+            echo "  -h, --host HOST          OpenSearch host (default: localhost)"
+            echo "  -p, --port PORT          OpenSearch port (default: 9200)"
             echo "  --help                   Show this help message"
             echo ""
             echo "Example:"
-            echo "  $0 --dataset scifact"
+            echo "  $0 --dataset scifact --host myserver.com --port 9201"
+            echo "  $0 --dataset esci-product    # Uses special ESCI ingestion script"
             exit 0
             ;;
         *)
@@ -38,6 +51,8 @@ DATASET_URLS["fiqa"]="https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/
 DATASET_URLS["arguana"]="https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/arguana.zip"
 
 echo "=== OpenSearch Setup for Dynamic Hybrid Search POC ==="
+echo "OpenSearch Host: $HOST"
+echo "OpenSearch Port: $PORT"
 if [ -n "$DATASET_NAME" ]; then
     echo "Dataset: $DATASET_NAME"
 fi
@@ -54,18 +69,18 @@ RESET='\033[0m' # No Color
 
 # 1. Check if OpenSearch is running
 echo "Checking OpenSearch status..."
-if curl -s localhost:9200 > /dev/null 2>&1; then
+if curl -s $HOST:$PORT > /dev/null 2>&1; then
     echo -e "${GREEN}✓ OpenSearch is running${NC}"
     
     # Get cluster info
-    CLUSTER_INFO=$(curl -s localhost:9200)
+    CLUSTER_INFO=$(curl -s $HOST:$PORT)
     VERSION=$(echo $CLUSTER_INFO | grep -o '"number" : "[^"]*"' | cut -d'"' -f4)
     echo "  Version: $VERSION"
 else
-    echo -e "${RED}✗ OpenSearch is not running on localhost:9200${NC}"
+    echo -e "${RED}✗ OpenSearch is not running on $HOST:$PORT${NC}"
     echo ""
     echo "Please start OpenSearch first. You can use Docker:"
-    echo "  docker run -d --name opensearch -p 9200:9200 -p 9300:9300 \\"
+    echo "  docker run -d --name opensearch -p $PORT:$PORT -p 9300:9300 \\"
     echo "    -e \"discovery.type=single-node\" \\"
     echo "    -e \"plugins.security.disabled=true\" \\"
     echo "    opensearchproject/opensearch:2.11.0"
@@ -75,7 +90,7 @@ fi
 # 2. Check neural-search plugin
 echo ""
 echo "Checking neural-search plugin..."
-if curl -s localhost:9200/_cat/plugins 2>/dev/null | grep -q neural-search; then
+if curl -s $HOST:$PORT/_cat/plugins 2>/dev/null | grep -q neural-search; then
     echo -e "${GREEN}✓ Neural-search plugin is installed${NC}"
 else
     echo -e "${YELLOW}⚠ Neural-search plugin not found${NC}"
@@ -85,11 +100,11 @@ fi
 # 3. Check if index exists
 echo ""
 echo "Checking index 'my-nlp-index-1'..."
-if curl -s -o /dev/null -w "%{http_code}" localhost:9200/my-nlp-index-1 2>/dev/null | grep -q 200; then
+if curl -s -o /dev/null -w "%{http_code}" $HOST:$PORT/my-nlp-index-1 2>/dev/null | grep -q 200; then
     echo -e "${GREEN}✓ Index already exists${NC}"
     
     # Get document count
-    DOC_COUNT=$(curl -s localhost:9200/my-nlp-index-1/_count 2>/dev/null | grep -o '"count":[0-9]*' | cut -d: -f2)
+    DOC_COUNT=$(curl -s $HOST:$PORT/my-nlp-index-1/_count 2>/dev/null | grep -o '"count":[0-9]*' | cut -d: -f2)
     echo "  Document count: $DOC_COUNT"
     
     if [ "$DOC_COUNT" -eq "0" ]; then
@@ -100,7 +115,7 @@ else
     echo "Creating index with hybrid mappings..."
     
     # Create index
-    RESPONSE=$(curl -s -X PUT "localhost:9200/my-nlp-index-1" \
+    RESPONSE=$(curl -s -X PUT "$HOST:$PORT/my-nlp-index-1" \
     -H "Content-Type: application/json" \
     -d '{
       "settings": {
@@ -144,7 +159,7 @@ else
 fi
 
 echo -e "${MAJOR}Configuring the ML Commons plugin.${RESET}"
-curl -s -X PUT "http://localhost:9200/_cluster/settings" -H 'Content-Type: application/json' --data-binary '{
+curl -s -X PUT "http://$HOST:$PORT/_cluster/settings" -H 'Content-Type: application/json' --data-binary '{
   "persistent": {
         "plugins": {
             "ml_commons": {
@@ -158,7 +173,7 @@ curl -s -X PUT "http://localhost:9200/_cluster/settings" -H 'Content-Type: appli
 
 echo
 echo -e "${MAJOR}Lookup or Register a model group.${RESET}"
-response=$(curl -s -X POST "http://localhost:9200/_plugins/_ml/model_groups/_search" \
+response=$(curl -s -X POST "http://$HOST:$PORT/_plugins/_ml/model_groups/_search" \
   -H 'Content-Type: application/json' \
   --data-binary '{
     "query": {
@@ -182,7 +197,7 @@ model_group_id=$(echo "$response" | jq -r '.hits.hits[0]._id')
 # Check if model_group_id is blank or "null"
 if [ -z "$model_group_id" ] || [ "$model_group_id" = "null" ]; then
   echo "No existing model group found, creating a new one..."
-  response=$(curl -s -X POST "http://localhost:9200/_plugins/_ml/model_groups/_register" \
+  response=$(curl -s -X POST "http://$HOST:$PORT/_plugins/_ml/model_groups/_register" \
     -H 'Content-Type: application/json' \
     --data-binary '{
       "name": "neural_search_model_group",
@@ -197,7 +212,7 @@ else
 fi
 
 echo -e "${MAJOR}Registering a model in the model group.${RESET}"
-response=$(curl -s -X POST "http://localhost:9200/_plugins/_ml/models/_register" \
+response=$(curl -s -X POST "http://$HOST:$PORT/_plugins/_ml/models/_register" \
   -H 'Content-Type: application/json' \
   --data-binary "{
      \"name\": \"huggingface/sentence-transformers/all-MiniLM-L6-v2\",
@@ -218,7 +233,7 @@ max_attempts=10
 attempts=0
 
 # Wait for task to be COMPLETED
-while [[ "$(curl -s localhost:9200/_plugins/_ml/tasks/$task_id | jq -r '.state')" != "COMPLETED" && $attempts -lt $max_attempts ]]; do
+while [[ "$(curl -s $HOST:$PORT/_plugins/_ml/tasks/$task_id | jq -r '.state')" != "COMPLETED" && $attempts -lt $max_attempts ]]; do
     echo "Waiting for task to complete... attempt $((attempts + 1))/$max_attempts"
     sleep 5
     attempts=$((attempts + 1))
@@ -228,13 +243,13 @@ if [[ $attempts -ge $max_attempts ]]; then
     echo "Limit of attempts reached. Something went wrong with registering the model. Check OpenSearch logs."
     exit 1
 else
-    response=$(curl -s localhost:9200/_plugins/_ml/tasks/$task_id)
+    response=$(curl -s $HOST:$PORT/_plugins/_ml/tasks/$task_id)
     model_id=$(echo "$response" | jq -r '.model_id')
     echo "Task completed successfully! Model registered with id: $model_id"
 fi
 
 echo -e "${MAJOR}Deploying the model.${RESET}"
-response=$(curl -s -X POST "http://localhost:9200/_plugins/_ml/models/$model_id/_deploy")
+response=$(curl -s -X POST "http://$HOST:$PORT/_plugins/_ml/models/$model_id/_deploy")
 
 # Extract the task_id from the JSON response
 deploy_task_id=$(echo "$response" | jq -r '.task_id')
@@ -245,7 +260,7 @@ echo -e "${MAJOR}Waiting for the model to be deployed.${RESET}"
 # Reset attempts
 attempts=0
 
-while [[ "$(curl -s localhost:9200/_plugins/_ml/tasks/$deploy_task_id | jq -r '.state')" != "COMPLETED" && $attempts -lt $max_attempts ]]; do
+while [[ "$(curl -s $HOST:$PORT/_plugins/_ml/tasks/$deploy_task_id | jq -r '.state')" != "COMPLETED" && $attempts -lt $max_attempts ]]; do
     echo "Waiting for deployment task to complete... attempt $((attempts + 1))/$max_attempts"
     sleep 5
     attempts=$((attempts + 1))
@@ -254,13 +269,13 @@ done
 if [[ $attempts -ge $max_attempts ]]; then
     echo "Limit of attempts reached. Something went wrong with deploying the model. Check OpenSearch logs."
 else
-    response=$(curl -s localhost:9200/_plugins/_ml/tasks/$deploy_task_id)
+    response=$(curl -s $HOST:$PORT/_plugins/_ml/tasks/$deploy_task_id)
     echo "Deployment task completed successfully!"
 fi
 
 # Check state of deployed model
 attempts=0
-while [[ "$(curl -s localhost:9200/_plugins/_ml/models/$model_id | jq -r '.model_state')" != "DEPLOYED" && $attempts -lt $max_attempts ]]; do
+while [[ "$(curl -s $HOST:$PORT/_plugins/_ml/models/$model_id | jq -r '.model_state')" != "DEPLOYED" && $attempts -lt $max_attempts ]]; do
     echo "Waiting for task to complete... attempt $((attempts + 1))/$max_attempts"
     sleep 5
     attempts=$((attempts + 1))
@@ -273,7 +288,7 @@ else
 fi
 
 echo -e "${MAJOR}Creating an ingest pipeline for embedding generation during index time.${RESET}"
-curl -s -X PUT "http://localhost:9200/_ingest/pipeline/embeddings-pipeline" \
+curl -s -X PUT "http://$HOST:$PORT/_ingest/pipeline/embeddings-pipeline" \
   -H 'Content-Type: application/json' \
   --data-binary "{
      \"description\": \"A text embedding pipeline\",
@@ -304,7 +319,7 @@ echo "Testing hybrid query..."
 
 # Use the model we just deployed
 if [ -n "$model_id" ]; then
-    TEST_RESPONSE=$(curl -s -X POST "localhost:9200/my-nlp-index-1/_search" \
+    TEST_RESPONSE=$(curl -s -X POST "$HOST:$PORT/my-nlp-index-1/_search" \
     -H "Content-Type: application/json" \
     -d "{
       \"size\": 1,
@@ -336,20 +351,20 @@ echo ""
 # Check all prerequisites
 READY=true
 
-if ! curl -s localhost:9200 > /dev/null 2>&1; then
+if ! curl -s $HOST:$PORT > /dev/null 2>&1; then
     echo -e "${RED}✗ OpenSearch not running${NC}"
     READY=false
 else
     echo -e "${GREEN}✓ OpenSearch running${NC}"
 fi
 
-if curl -s localhost:9200/_cat/plugins 2>/dev/null | grep -q neural-search; then
+if curl -s $HOST:$PORT/_cat/plugins 2>/dev/null | grep -q neural-search; then
     echo -e "${GREEN}✓ Neural-search plugin installed${NC}"
 else
     echo -e "${YELLOW}⚠ Neural-search plugin not verified${NC}"
 fi
 
-if curl -s -o /dev/null -w "%{http_code}" localhost:9200/my-nlp-index-1 2>/dev/null | grep -q 200; then
+if curl -s -o /dev/null -w "%{http_code}" $HOST:$PORT/my-nlp-index-1 2>/dev/null | grep -q 200; then
     echo -e "${GREEN}✓ Index exists${NC}"
 else
     echo -e "${RED}✗ Index missing${NC}"
@@ -363,7 +378,7 @@ else
     READY=false
 fi
 
-DOC_COUNT=$(curl -s localhost:9200/my-nlp-index-1/_count 2>/dev/null | grep -o '"count":[0-9]*' | cut -d: -f2)
+DOC_COUNT=$(curl -s $HOST:$PORT/my-nlp-index-1/_count 2>/dev/null | grep -o '"count":[0-9]*' | cut -d: -f2)
 if [ -n "$DOC_COUNT" ] && [ "$DOC_COUNT" -gt "0" ]; then
     echo -e "${GREEN}✓ Index has data ($DOC_COUNT documents)${NC}"
 else
@@ -378,35 +393,55 @@ if [ "$READY" = true ] && [ -n "$model_id" ]; then
     # Ingest dataset if index is empty and dataset is specified
     if [ -z "$DOC_COUNT" ] || [ "$DOC_COUNT" -eq "0" ]; then
         if [ -n "$DATASET_NAME" ]; then
-            # Check if dataset URL exists
-            if [ -z "${DATASET_URLS[$DATASET_NAME]}" ]; then
-                echo -e "${RED}✗ Unknown dataset: $DATASET_NAME${NC}"
-                echo "Supported datasets: ${!DATASET_URLS[@]}"
-                exit 1
-            fi
-            
-            DATASET_URL="${DATASET_URLS[$DATASET_NAME]}"
-            echo -e "${MAJOR}Ingesting $DATASET_NAME dataset...${RESET}"
-            echo "Running: python3 test_opensearch_3.py -d $DATASET_NAME -u $DATASET_URL -h localhost -p 9200 -i my-nlp-index-1 -o ingest"
-            
-            python3 test_opensearch_3.py \
-                -d "$DATASET_NAME" \
-                -u "$DATASET_URL" \
-                -h localhost \
-                -p 9200 \
-                -i my-nlp-index-1 \
-                -o ingest
-            
-            if [ $? -eq 0 ]; then
-                echo -e "${GREEN}✓ Dataset ingestion completed${NC}"
+            # Special handling for esci-product dataset
+            if [ "$DATASET_NAME" = "esci-product" ]; then
+                echo -e "${MAJOR}Ingesting ESCI product dataset...${RESET}"
+                echo "Running: python3 dynamic_hybrid/esci_ingestion.py -m $model_id -h $HOST -p $PORT --full-dataset"
                 
-                # Check document count again
-                DOC_COUNT=$(curl -s localhost:9200/my-nlp-index-1/_count 2>/dev/null | grep -o '"count":[0-9]*' | cut -d: -f2)
-                echo "  Document count after ingestion: $DOC_COUNT"
+                python3 dynamic_hybrid/esci_ingestion.py -m "$model_id" -h "$HOST" -p "$PORT" --full-dataset
+                
+                if [ $? -eq 0 ]; then
+                    echo -e "${GREEN}✓ ESCI dataset ingestion completed${NC}"
+                    
+                    # Check document count again
+                    DOC_COUNT=$(curl -s $HOST:$PORT/my-nlp-index-1/_count 2>/dev/null | grep -o '"count":[0-9]*' | cut -d: -f2)
+                    echo "  Document count after ingestion: $DOC_COUNT"
+                else
+                    echo -e "${RED}✗ ESCI dataset ingestion failed${NC}"
+                    echo "Please check the error messages above"
+                    exit 1
+                fi
             else
-                echo -e "${RED}✗ Dataset ingestion failed${NC}"
-                echo "Please check the error messages above"
-                exit 1
+                # Check if dataset URL exists
+                if [ -z "${DATASET_URLS[$DATASET_NAME]}" ]; then
+                    echo -e "${RED}✗ Unknown dataset: $DATASET_NAME${NC}"
+                    echo "Supported datasets: ${!DATASET_URLS[@]} esci-product"
+                    exit 1
+                fi
+                
+                DATASET_URL="${DATASET_URLS[$DATASET_NAME]}"
+                echo -e "${MAJOR}Ingesting $DATASET_NAME dataset...${RESET}"
+                echo "Running: python3 test_opensearch_3.py -d $DATASET_NAME -u $DATASET_URL -h $HOST -p $PORT -i my-nlp-index-1 -o ingest"
+                
+                python3 test_opensearch_3.py \
+                    -d "$DATASET_NAME" \
+                    -u "$DATASET_URL" \
+                    -h $HOST \
+                    -p $PORT \
+                    -i my-nlp-index-1 \
+                    -o ingest
+                
+                if [ $? -eq 0 ]; then
+                    echo -e "${GREEN}✓ Dataset ingestion completed${NC}"
+                    
+                    # Check document count again
+                    DOC_COUNT=$(curl -s $HOST:$PORT/my-nlp-index-1/_count 2>/dev/null | grep -o '"count":[0-9]*' | cut -d: -f2)
+                    echo "  Document count after ingestion: $DOC_COUNT"
+                else
+                    echo -e "${RED}✗ Dataset ingestion failed${NC}"
+                    echo "Please check the error messages above"
+                    exit 1
+                fi
             fi
         else
             echo -e "${YELLOW}⚠ No dataset specified. Use -d/--dataset to ingest data.${NC}"
