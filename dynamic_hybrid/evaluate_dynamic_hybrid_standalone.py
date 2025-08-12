@@ -11,6 +11,7 @@ import logging
 from typing import Dict, List, Tuple, Optional
 from collections import defaultdict
 import numpy as np
+import random
 
 # Add current directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -61,7 +62,8 @@ class DynamicHybridSearchEvaluator:
                  index_name: str = "beir-index",
                  model_id: str = None,
                  use_ml_predictor: bool = False,
-                 model_path: Optional[str] = None):
+                 model_path: Optional[str] = None,
+                 random_seed: int = 42):
         """
         Initialize evaluator.
         
@@ -87,6 +89,7 @@ class DynamicHybridSearchEvaluator:
         self.model_id = model_id
         self.use_ml_predictor = use_ml_predictor
         self.model_path = model_path
+        self.random_seed = random_seed
         
         # Results storage
         self.query_weights = {}
@@ -146,9 +149,13 @@ class DynamicHybridSearchEvaluator:
         
         # Limit queries if max_queries is specified
         if max_queries is not None and max_queries < len(queries):
-            # Take first N queries
-            limited_queries = dict(list(queries.items())[:max_queries])
-            logger.info(f"Limited to {max_queries} queries for faster evaluation")
+            # Randomly select queries instead of taking first N
+            all_query_ids = list(queries.keys())
+            # Set seed for reproducibility
+            random.seed(self.random_seed)
+            selected_query_ids = random.sample(all_query_ids, max_queries)
+            limited_queries = {qid: queries[qid] for qid in selected_query_ids}
+            logger.info(f"Randomly selected {max_queries} queries for evaluation (seed: {self.random_seed})")
         else:
             limited_queries = queries
         
@@ -208,7 +215,8 @@ class DynamicHybridSearchEvaluator:
                 "precision": precision
             },
             "weight_distribution": dict(weight_distribution),
-            "is_dynamic": static_weights is None
+            "is_dynamic": static_weights is None,
+            "random_seed": self.random_seed if max_queries is not None else None
         }
         
         # Add average metrics
@@ -363,6 +371,19 @@ class DynamicHybridSearchEvaluator:
         
         logger.info(f"Dataset loaded. Corpus size: {len(corpus)}, Queries: {len(queries)}")
         
+        # Randomly select queries if max_queries is specified
+        if max_queries is not None and max_queries < len(queries):
+            # Convert to list for random sampling
+            all_query_ids = list(queries.keys())
+            # Set seed for reproducibility
+            random.seed(self.random_seed)
+            selected_query_ids = random.sample(all_query_ids, max_queries)
+            # Create subset of queries
+            queries = {qid: queries[qid] for qid in selected_query_ids}
+            # Also filter qrels to match selected queries
+            qrels = {qid: qrels[qid] for qid in selected_query_ids if qid in qrels}
+            logger.info(f"Randomly selected {max_queries} queries for evaluation (seed: {self.random_seed})")
+        
         # Evaluate with dynamic weights
         logger.info("Evaluating with dynamic weights...")
         dynamic_results = self.evaluate_dataset(
@@ -469,6 +490,8 @@ def main():
                        help='Step size for weight grid when testing all combinations (default: 0.1)')
     parser.add_argument('-q', '--max-queries', type=int, default=None, 
                        help='Maximum number of queries to evaluate (default: all)')
+    parser.add_argument('--seed', type=int, default=42,
+                       help='Random seed for query selection when using max-queries (default: 42)')
     
     args = parser.parse_args()
     
@@ -500,7 +523,8 @@ def main():
         index_name=args.index,
         model_id=args.model_id,
         use_ml_predictor=args.use_ml,
-        model_path=args.weight_predictor_model
+        model_path=args.weight_predictor_model,
+        random_seed=args.seed
     )
     
     # Store dataset name for search field mapping
@@ -555,6 +579,8 @@ def main():
     # Print summary
     if args.compare:
         print("\n=== Comparison Summary ===")
+        if args.max_queries:
+            print(f"Random seed used for query selection: {args.seed}")
         for comp in results["comparisons"]:
             print(f"\nStatic weights: {comp['static_weights']}")
             for metric, data in comp["improvements"].items():
@@ -565,6 +591,8 @@ def main():
         print(f"Dataset: {results['dataset']}")
         print(f"Domain: {results['domain']}")
         print(f"Number of queries: {results['num_queries']}")
+        if args.max_queries:
+            print(f"Random seed used for query selection: {args.seed}")
         print("\nAverage metrics:")
         for metric, value in results['average_metrics'].items():
             print(f"  {metric}: {value:.4f}")
