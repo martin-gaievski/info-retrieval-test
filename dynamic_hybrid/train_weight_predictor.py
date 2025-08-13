@@ -17,6 +17,7 @@ from collections import defaultdict
 import pickle
 from tqdm import tqdm
 from sklearn.linear_model import LinearRegression, LogisticRegression
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from sklearn.model_selection import train_test_split, cross_val_score
 from sklearn.metrics import mean_squared_error, r2_score, accuracy_score, classification_report, confusion_matrix
 from sklearn.preprocessing import StandardScaler, PolynomialFeatures
@@ -79,7 +80,8 @@ class WeightPredictorTrainer:
                  port: int = 9200,
                  index_name: str = "beir-index",
                  model_id: str = None,
-                 use_basic_features: bool = False):
+                 use_basic_features: bool = False,
+                 random_state: int = 42):
         """Initialize trainer"""
         self.client = OpenSearch(
             hosts=[{'host': host, 'port': port}],
@@ -94,6 +96,7 @@ class WeightPredictorTrainer:
         self.index_name = index_name
         self.model_id = model_id
         self.use_basic_features = use_basic_features
+        self.random_state = random_state
         
         # Training data storage
         self.training_data = []
@@ -339,7 +342,7 @@ class WeightPredictorTrainer:
         
         Args:
             training_df: DataFrame with training data
-            model_type: "regression" or "classification"
+            model_type: "regression", "classification", "random_forest", or "gradient_boosting"
             feature_columns: List of feature columns to use (None for auto-detect)
             use_polynomial_features: Whether to create polynomial features (for classification)
             
@@ -349,13 +352,14 @@ class WeightPredictorTrainer:
         if model_type == "classification":
             return self._train_classification_model(training_df, feature_columns, use_polynomial_features)
         else:
-            return self._train_regression_model(training_df, feature_columns)
+            return self._train_regression_model(training_df, feature_columns, model_type)
     
     def _train_regression_model(self, 
                                training_df: pd.DataFrame,
-                               feature_columns: Optional[List[str]] = None) -> Dict:
-        """Train linear regression model (original functionality)"""
-        logger.info("Training linear regression model...")
+                               feature_columns: Optional[List[str]] = None,
+                               model_type: str = "regression") -> Dict:
+        """Train regression model (linear, random forest, or gradient boosting)"""
+        logger.info(f"Training {model_type} model...")
         
         # Auto-detect feature columns if not specified
         if feature_columns is None:
@@ -374,7 +378,7 @@ class WeightPredictorTrainer:
         
         # Split data
         X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.2, random_state=42
+            X, y, test_size=0.2, random_state=self.random_state
         )
         
         # Scale features
@@ -382,8 +386,28 @@ class WeightPredictorTrainer:
         X_train_scaled = scaler.fit_transform(X_train)
         X_test_scaled = scaler.transform(X_test)
         
-        # Train model
-        model = LinearRegression()
+        # Train model based on type
+        if model_type == "random_forest":
+            model = RandomForestRegressor(
+                n_estimators=100,
+                max_depth=10,
+                min_samples_split=5,
+                min_samples_leaf=2,
+                random_state=self.random_state,
+                n_jobs=-1
+            )
+        elif model_type == "gradient_boosting":
+            model = GradientBoostingRegressor(
+                n_estimators=100,
+                learning_rate=0.1,
+                max_depth=5,
+                min_samples_split=5,
+                min_samples_leaf=2,
+                random_state=self.random_state
+            )
+        else:  # Default to linear regression
+            model = LinearRegression()
+        
         model.fit(X_train_scaled, y_train)
         
         # Evaluate
@@ -402,21 +426,32 @@ class WeightPredictorTrainer:
         logger.info(f"Training MSE: {train_mse:.4f}, R²: {train_r2:.4f}")
         logger.info(f"Test MSE: {test_mse:.4f}, R²: {test_r2:.4f}")
         
-        # Feature importance
-        feature_importance = pd.DataFrame({
-            'feature': feature_columns,
-            'coefficient': model.coef_,
-            'abs_coefficient': np.abs(model.coef_)
-        }).sort_values('abs_coefficient', ascending=False)
-        
-        logger.info("\nTop 10 most important features:")
-        print(feature_importance.head(10))
+        # Feature importance (different for tree-based vs linear models)
+        if model_type in ["random_forest", "gradient_boosting"]:
+            # Tree-based models have feature_importances_
+            feature_importance = pd.DataFrame({
+                'feature': feature_columns,
+                'importance': model.feature_importances_
+            }).sort_values('importance', ascending=False)
+            
+            logger.info("\nTop 10 most important features:")
+            print(feature_importance.head(10))
+        else:
+            # Linear models have coefficients
+            feature_importance = pd.DataFrame({
+                'feature': feature_columns,
+                'coefficient': model.coef_,
+                'abs_coefficient': np.abs(model.coef_)
+            }).sort_values('abs_coefficient', ascending=False)
+            
+            logger.info("\nTop 10 most important features:")
+            print(feature_importance.head(10))
         
         return {
             'model': model,
             'scaler': scaler,
             'feature_columns': feature_columns,
-            'model_type': 'regression',
+            'model_type': model_type,  # Store actual model type (regression, random_forest, gradient_boosting)
             'metrics': {
                 'train_mse': train_mse,
                 'test_mse': test_mse,
@@ -459,7 +494,7 @@ class WeightPredictorTrainer:
         
         # Split data
         X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.2, random_state=42, stratify=y
+            X, y, test_size=0.2, random_state=self.random_state, stratify=y
         )
         
         # Scale features
@@ -481,7 +516,7 @@ class WeightPredictorTrainer:
             solver='lbfgs',  # Better solver for multi-class
             class_weight=class_weight_dict,
             max_iter=1000,
-            random_state=42
+            random_state=self.random_state
         )
         model.fit(X_train_scaled, y_train)
         
@@ -697,15 +732,20 @@ def main():
                        help='Step size for weight grid (default: 0.1)')
     parser.add_argument('--training-data-file', default=None,
                        help='Save/load training data to/from this file')
-    parser.add_argument('--model-type', choices=['regression', 'classification'], 
+    parser.add_argument('--model-type', choices=['regression', 'classification', 'random_forest', 'gradient_boosting'], 
                        default='regression',
-                       help='Type of model to train (default: regression)')
+                       help='Type of model to train: regression (linear), classification (logistic), random_forest, gradient_boosting')
     parser.add_argument('--no-polynomial', action='store_true',
                        help='Disable polynomial feature creation (for classification)')
     parser.add_argument('--use-basic-features', action='store_true',
                        help='Use only basic features for ESCI dataset')
+    parser.add_argument('--seed', type=int, default=42,
+                       help='Random seed for reproducibility (default: 42)')
     
     args = parser.parse_args()
+    
+    # Set random seed for reproducibility
+    np.random.seed(args.seed)
     
     # Initialize trainer
     trainer = WeightPredictorTrainer(
