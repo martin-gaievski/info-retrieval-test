@@ -212,68 +212,130 @@ class DomainAwareWeightPredictor(WeightPredictor):
 
 
 class MLWeightPredictor(WeightPredictor):
-    """Machine learning based weight prediction with tuned defaults"""
+    """Machine learning based weight prediction with support for both regression and classification"""
     
     def __init__(self, model_path: Optional[str] = None, feature_names: Optional[list] = None, domain: Domain = Domain.GENERAL):
         self.model = None
+        self.scaler = None
+        self.poly_transformer = None
         self.feature_names = feature_names
+        self.feature_columns = None
         self.domain = domain
         self.fallback_predictor = DomainAwareWeightPredictor(domain)
+        self.model_type = 'regression'  # Default
+        self.class_to_weights = None
         
         if model_path:
             try:
                 with open(model_path, 'rb') as f:
                     model_dict = pickle.load(f)
                     self.model = model_dict['model']
-                    self.feature_names = model_dict.get('feature_names', feature_names)
-                    self.train_r2 = model_dict.get('train_r2', None)
-                    self.test_r2 = model_dict.get('test_r2', None)
-                    print(f"Loaded model with {len(self.feature_names)} features")
-                    if self.train_r2 is not None:
-                        print(f"Model R²: train={self.train_r2:.3f}, test={self.test_r2:.3f}")
+                    self.scaler = model_dict.get('scaler', None)
+                    self.poly_transformer = model_dict.get('poly_transformer', None)
+                    
+                    # Handle different model types
+                    self.model_type = model_dict.get('model_type', 'regression')
+                    
+                    if self.model_type == 'classification':
+                        # Classification model
+                        self.feature_columns = model_dict.get('feature_columns', [])
+                        self.class_to_weights = model_dict.get('class_to_weights', {})
+                        print(f"Loaded classification model with {len(self.feature_columns)} base features")
+                        if 'metrics' in model_dict:
+                            metrics = model_dict['metrics']
+                            print(f"Model accuracy: train={metrics.get('train_accuracy', 0):.3f}, "
+                                  f"test={metrics.get('test_accuracy', 0):.3f}")
+                    else:
+                        # Regression model - handle both old and new format
+                        self.feature_names = model_dict.get('feature_names', model_dict.get('feature_columns', feature_names))
+                        self.train_r2 = model_dict.get('metrics', {}).get('train_r2', None)
+                        self.test_r2 = model_dict.get('metrics', {}).get('test_r2', None)
+                        if self.feature_names:
+                            print(f"Loaded regression model with {len(self.feature_names)} features")
+                        if self.train_r2 is not None:
+                            print(f"Model R²: train={self.train_r2:.3f}, test={self.test_r2:.3f}")
             except Exception as e:
                 print(f"Failed to load model: {e}")
     
     def predict_weights(self, features: Dict[str, float]) -> Tuple[float, float]:
         """Predict weights using ML model with fallback to heuristics"""
-        if self.model is None or self.feature_names is None:
+        if self.model is None:
             # No model available, use fallback
             return self.fallback_predictor.predict_weights(features)
         
         try:
-            # Prepare feature vector
-            feature_vector = []
-            for fname in self.feature_names:
-                feature_vector.append(features.get(fname, 0.0))
-            
-            # Predict lexical weight
-            X = np.array(feature_vector).reshape(1, -1)
-            lexical_weight = self.model.predict(X)[0]
-            
-            # TUNED: More aggressive clamping for poor models
-            # If model has poor R², push predictions toward optimal range
-            if self.test_r2 is not None and self.test_r2 < 0:
-                # Bad model - use more aggressive fallback
-                print(f"Poor model R²={self.test_r2:.3f}, using tuned fallback")
-                return self.fallback_predictor.predict_weights(features)
-            
-            # Ensure weights are in valid range
-            lexical_weight = max(0.1, min(0.9, lexical_weight))
-            neural_weight = 1.0 - lexical_weight
-            
-            # Round to nearest 0.1
-            lexical_weight = round(lexical_weight * 10) / 10
-            neural_weight = round(neural_weight * 10) / 10
-            
-            # Ensure they sum to 1.0
-            if lexical_weight + neural_weight != 1.0:
-                neural_weight = 1.0 - lexical_weight
-            
-            return (lexical_weight, neural_weight)
+            if self.model_type == 'classification':
+                return self._predict_classification(features)
+            else:
+                return self._predict_regression(features)
             
         except Exception as e:
             print(f"ML prediction failed: {e}, using fallback")
             return self.fallback_predictor.predict_weights(features)
+    
+    def _predict_classification(self, features: Dict[str, float]) -> Tuple[float, float]:
+        """Predict using classification model"""
+        # Prepare feature vector
+        feature_vector = []
+        for fname in self.feature_columns:
+            feature_vector.append(features.get(fname, 0.0))
+        
+        X = np.array(feature_vector).reshape(1, -1)
+        
+        # Apply polynomial transformation if needed
+        if self.poly_transformer is not None:
+            X = self.poly_transformer.transform(X)
+        
+        # Scale features
+        if self.scaler is not None:
+            X = self.scaler.transform(X)
+        
+        # Predict class
+        predicted_class = self.model.predict(X)[0]
+        
+        # Map class to weights
+        if predicted_class in self.class_to_weights:
+            weights = self.class_to_weights[predicted_class]
+            return (weights[0], weights[1])
+        else:
+            print(f"Unknown class {predicted_class}, using fallback")
+            return self.fallback_predictor.predict_weights(features)
+    
+    def _predict_regression(self, features: Dict[str, float]) -> Tuple[float, float]:
+        """Predict using regression model (backward compatibility)"""
+        # Prepare feature vector
+        feature_vector = []
+        for fname in self.feature_names:
+            feature_vector.append(features.get(fname, 0.0))
+        
+        # Predict lexical weight
+        X = np.array(feature_vector).reshape(1, -1)
+        
+        # Scale if scaler is available
+        if self.scaler is not None:
+            X = self.scaler.transform(X)
+        
+        lexical_weight = self.model.predict(X)[0]
+        
+        # Check for poor models
+        if hasattr(self, 'test_r2') and self.test_r2 is not None and self.test_r2 < 0:
+            # Bad model - use more aggressive fallback
+            print(f"Poor model R²={self.test_r2:.3f}, using tuned fallback")
+            return self.fallback_predictor.predict_weights(features)
+        
+        # Ensure weights are in valid range
+        lexical_weight = max(0.1, min(0.9, lexical_weight))
+        neural_weight = 1.0 - lexical_weight
+        
+        # Round to nearest 0.1
+        lexical_weight = round(lexical_weight * 10) / 10
+        neural_weight = round(neural_weight * 10) / 10
+        
+        # Ensure they sum to 1.0
+        if lexical_weight + neural_weight != 1.0:
+            neural_weight = 1.0 - lexical_weight
+        
+        return (lexical_weight, neural_weight)
 
 
 def get_predictor_for_dataset(dataset_name: str, use_ml: bool = False, model_path: Optional[str] = None) -> WeightPredictor:

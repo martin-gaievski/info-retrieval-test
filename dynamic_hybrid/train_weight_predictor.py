@@ -1,7 +1,8 @@
 """
-Train a linear regression model for dynamic hybrid search weight prediction.
+Train a model for dynamic hybrid search weight prediction.
 This script collects training data by evaluating queries with different weights
-and trains a model to predict optimal weights based on query features.
+and trains either regression or classification models based on query features.
+Supports both continuous weight prediction (regression) and discrete weight classes (classification).
 """
 
 import os
@@ -15,10 +16,11 @@ from typing import Dict, List, Tuple, Optional
 from collections import defaultdict
 import pickle
 from tqdm import tqdm
-from sklearn.linear_model import LinearRegression
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_squared_error, r2_score
-from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LinearRegression, LogisticRegression
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.metrics import mean_squared_error, r2_score, accuracy_score, classification_report, confusion_matrix
+from sklearn.preprocessing import StandardScaler, PolynomialFeatures
+from sklearn.utils.class_weight import compute_class_weight
 
 # Add dynamic_hybrid to path for imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -43,6 +45,10 @@ from opensearchpy import OpenSearch
 
 # Local imports
 from feature_extractor import DomainAwareFeatureExtractor, get_domain_for_dataset
+try:
+    from feature_extractor_esci_basic import ESCIBasicFeatureExtractor
+except ImportError:
+    ESCIBasicFeatureExtractor = None
 
 # Configure logging
 logging.basicConfig(format='%(asctime)s - %(message)s',
@@ -52,14 +58,28 @@ logging.basicConfig(format='%(asctime)s - %(message)s',
 logger = logging.getLogger(__name__)
 
 
+# Define weight classes for classification
+WEIGHT_CLASSES = {
+    (0.9, 0.1): 0,  # Lexical-heavy
+    (0.7, 0.3): 1,  # Balanced-lexical
+    (0.5, 0.5): 2,  # Equal
+    (0.3, 0.7): 3,  # Balanced-neural
+    (0.1, 0.9): 4   # Neural-heavy
+}
+
+# Reverse mapping
+CLASS_TO_WEIGHTS = {v: k for k, v in WEIGHT_CLASSES.items()}
+
+
 class WeightPredictorTrainer:
-    """Trainer for weight prediction model"""
+    """Trainer for weight prediction models (regression or classification)"""
     
     def __init__(self, 
                  host: str = "localhost",
                  port: int = 9200,
                  index_name: str = "beir-index",
-                 model_id: str = None):
+                 model_id: str = None,
+                 use_basic_features: bool = False):
         """Initialize trainer"""
         self.client = OpenSearch(
             hosts=[{'host': host, 'port': port}],
@@ -73,6 +93,7 @@ class WeightPredictorTrainer:
         
         self.index_name = index_name
         self.model_id = model_id
+        self.use_basic_features = use_basic_features
         
         # Training data storage
         self.training_data = []
@@ -116,9 +137,18 @@ class WeightPredictorTrainer:
             queries = {qid: queries[qid] for qid in query_ids}
             logger.info(f"Sampled {sample_size} queries for training")
         
-        # Get domain and initialize feature extractor
-        domain = get_domain_for_dataset(dataset_name)
-        feature_extractor = DomainAwareFeatureExtractor(domain)
+        # Initialize feature extractor
+        if dataset_name.lower() == "esci" and self.use_basic_features:
+            if ESCIBasicFeatureExtractor:
+                feature_extractor = ESCIBasicFeatureExtractor()
+                logger.info("Using ESCIBasicFeatureExtractor (basic features only)")
+            else:
+                logger.warning("ESCIBasicFeatureExtractor not available, falling back to domain-aware extractor")
+                domain = get_domain_for_dataset(dataset_name)
+                feature_extractor = DomainAwareFeatureExtractor(domain)
+        else:
+            domain = get_domain_for_dataset(dataset_name)
+            feature_extractor = DomainAwareFeatureExtractor(domain)
         
         logger.info(f"Testing {len(weight_grid)} weight combinations on {len(queries)} queries")
         
@@ -301,17 +331,30 @@ class WeightPredictorTrainer:
     
     def train_model(self, 
                    training_df: pd.DataFrame,
-                   feature_columns: Optional[List[str]] = None) -> Dict:
+                   model_type: str = "regression",
+                   feature_columns: Optional[List[str]] = None,
+                   use_polynomial_features: bool = False) -> Dict:
         """
-        Train linear regression model on collected data.
+        Train weight prediction model on collected data.
         
         Args:
             training_df: DataFrame with training data
+            model_type: "regression" or "classification"
             feature_columns: List of feature columns to use (None for auto-detect)
+            use_polynomial_features: Whether to create polynomial features (for classification)
             
         Returns:
             Dictionary with model, scaler, and evaluation metrics
         """
+        if model_type == "classification":
+            return self._train_classification_model(training_df, feature_columns, use_polynomial_features)
+        else:
+            return self._train_regression_model(training_df, feature_columns)
+    
+    def _train_regression_model(self, 
+                               training_df: pd.DataFrame,
+                               feature_columns: Optional[List[str]] = None) -> Dict:
+        """Train linear regression model (original functionality)"""
         logger.info("Training linear regression model...")
         
         # Auto-detect feature columns if not specified
@@ -373,6 +416,7 @@ class WeightPredictorTrainer:
             'model': model,
             'scaler': scaler,
             'feature_columns': feature_columns,
+            'model_type': 'regression',
             'metrics': {
                 'train_mse': train_mse,
                 'test_mse': test_mse,
@@ -382,13 +426,194 @@ class WeightPredictorTrainer:
             'feature_importance': feature_importance
         }
     
+    def _train_classification_model(self, 
+                                   training_df: pd.DataFrame,
+                                   feature_columns: Optional[List[str]] = None,
+                                   use_polynomial_features: bool = True) -> Dict:
+        """Train logistic regression classifier for weight prediction"""
+        logger.info("Training logistic regression classifier...")
+        
+        # Convert continuous weights to classes
+        training_df = self._add_weight_classes(training_df)
+        
+        # Auto-detect feature columns if not specified
+        if feature_columns is None:
+            exclude_cols = ['query_id', 'query_text', 'best_lexical_weight', 
+                          'best_neural_weight', 'best_score', 'weight_scores', 'weight_class']
+            feature_columns = [col for col in training_df.columns 
+                             if col not in exclude_cols]
+        
+        logger.info(f"Using features: {feature_columns}")
+        
+        # Prepare features and target
+        X = training_df[feature_columns].values
+        y = training_df['weight_class'].values
+        
+        # Create polynomial features if requested
+        poly_transformer = None
+        if use_polynomial_features:
+            poly_transformer = PolynomialFeatures(degree=2, interaction_only=True, 
+                                                 include_bias=False)
+            X = poly_transformer.fit_transform(X)
+            logger.info(f"Created polynomial features. Shape: {X.shape}")
+        
+        # Split data
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42, stratify=y
+        )
+        
+        # Scale features
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_test_scaled = scaler.transform(X_test)
+        
+        # Calculate class weights to handle imbalance
+        class_weights = compute_class_weight(
+            'balanced', 
+            classes=np.unique(y_train), 
+            y=y_train
+        )
+        class_weight_dict = {i: w for i, w in enumerate(class_weights)}
+        
+        # Train model
+        model = LogisticRegression(
+            # multi_class='ovr' removed - default handles it properly
+            solver='lbfgs',  # Better solver for multi-class
+            class_weight=class_weight_dict,
+            max_iter=1000,
+            random_state=42
+        )
+        model.fit(X_train_scaled, y_train)
+        
+        # Predictions
+        y_pred_train = model.predict(X_train_scaled)
+        y_pred_test = model.predict(X_test_scaled)
+        
+        # Calculate metrics
+        train_accuracy = accuracy_score(y_train, y_pred_train)
+        test_accuracy = accuracy_score(y_test, y_pred_test)
+        
+        # Cross-validation
+        cv_scores = cross_val_score(model, X_train_scaled, y_train, cv=5)
+        
+        logger.info(f"Training accuracy: {train_accuracy:.4f}")
+        logger.info(f"Test accuracy: {test_accuracy:.4f}")
+        logger.info(f"Cross-validation accuracy: {cv_scores.mean():.4f} (+/- {cv_scores.std() * 2:.4f})")
+        
+        # Classification report
+        class_names = [f"{CLASS_TO_WEIGHTS[i][0]}/{CLASS_TO_WEIGHTS[i][1]}" 
+                      for i in range(len(WEIGHT_CLASSES))]
+        logger.info("\nClassification Report:")
+        print(classification_report(y_test, y_pred_test, target_names=class_names))
+        
+        # Confusion matrix
+        logger.info("\nConfusion Matrix:")
+        cm = confusion_matrix(y_test, y_pred_test)
+        print(cm)
+        
+        # Feature importance (from coefficients)
+        feature_importance = self._calculate_classification_feature_importance(
+            model, feature_columns, poly_transformer
+        )
+        
+        return {
+            'model': model,
+            'scaler': scaler,
+            'poly_transformer': poly_transformer,
+            'feature_columns': feature_columns,
+            'class_weights': class_weight_dict,
+            'model_type': 'classification',
+            'weight_classes': WEIGHT_CLASSES,
+            'class_to_weights': CLASS_TO_WEIGHTS,
+            'metrics': {
+                'train_accuracy': train_accuracy,
+                'test_accuracy': test_accuracy,
+                'cv_accuracy_mean': cv_scores.mean(),
+                'cv_accuracy_std': cv_scores.std(),
+                'classification_report': classification_report(y_test, y_pred_test, output_dict=True),
+                'confusion_matrix': cm.tolist()
+            },
+            'feature_importance': feature_importance
+        }
+    
+    def _add_weight_classes(self, training_df: pd.DataFrame) -> pd.DataFrame:
+        """Add weight class labels to training data"""
+        def get_weight_class(row):
+            weights = (row['best_lexical_weight'], row['best_neural_weight'])
+            # Find closest weight class
+            min_dist = float('inf')
+            best_class = 0
+            for class_weights, class_id in WEIGHT_CLASSES.items():
+                dist = abs(weights[0] - class_weights[0]) + abs(weights[1] - class_weights[1])
+                if dist < min_dist:
+                    min_dist = dist
+                    best_class = class_id
+            return best_class
+        
+        training_df['weight_class'] = training_df.apply(get_weight_class, axis=1)
+        return training_df
+    
+    def _calculate_classification_feature_importance(self, model, feature_columns, poly_transformer):
+        """Calculate feature importance from logistic regression coefficients"""
+        # For multi-class, average absolute coefficients across classes
+        avg_coef = np.mean(np.abs(model.coef_), axis=0)
+        
+        # Get feature names
+        if poly_transformer:
+            feature_names = poly_transformer.get_feature_names_out(feature_columns)
+        else:
+            feature_names = feature_columns
+        
+        # Create importance DataFrame
+        importance_df = pd.DataFrame({
+            'feature': feature_names,
+            'importance': avg_coef
+        }).sort_values('importance', ascending=False)
+        
+        logger.info("\nTop 10 most important features:")
+        print(importance_df.head(10))
+        
+        return importance_df
+    
     def save_model(self, model_dict: Dict, output_path: str):
         """Save trained model and associated data"""
         with open(output_path, 'wb') as f:
             pickle.dump(model_dict, f)
         logger.info(f"Model saved to {output_path}")
+        
+        # Save Java-compatible parameters for classification models
+        if model_dict.get('model_type') == 'classification':
+            self._save_java_parameters(model_dict, output_path)
     
-    def analyze_training_data(self, training_df: pd.DataFrame) -> Dict:
+    def _save_java_parameters(self, model_dict: Dict, base_path: str):
+        """Save model parameters in a format easy to copy to Java"""
+        java_path = base_path.replace('.pkl', '_java_params.json')
+        
+        model = model_dict['model']
+        scaler = model_dict['scaler']
+        
+        java_params = {
+            'coefficients': model.coef_.tolist(),
+            'intercepts': model.intercept_.tolist(),
+            'scaler_mean': scaler.mean_.tolist(),
+            'scaler_scale': scaler.scale_.tolist(),  # Fixed: use scale_ not std_
+            'feature_columns': model_dict['feature_columns'],
+            'weight_classes': {str(k): v for k, v in WEIGHT_CLASSES.items()},
+            'class_to_weights': {str(k): v for k, v in CLASS_TO_WEIGHTS.items()}
+        }
+        
+        if model_dict.get('poly_transformer'):
+            java_params['polynomial_features'] = True
+            java_params['polynomial_degree'] = 2
+            java_params['interaction_only'] = True
+        
+        with open(java_path, 'w') as f:
+            json.dump(java_params, f, indent=2)
+        
+        logger.info(f"Java parameters saved to {java_path}")
+    
+    def analyze_training_data(self, training_df: pd.DataFrame, 
+                            model_type: str = "regression") -> Dict:
         """Analyze the training data distribution"""
         # Handle empty DataFrame
         if len(training_df) == 0:
@@ -402,7 +627,7 @@ class WeightPredictorTrainer:
                 'avg_best_score': 0.0,
                 'score_by_weights': {}
             }
-            
+        
         analysis = {
             'total_examples': len(training_df),
             'weight_distribution': training_df.groupby(
@@ -411,6 +636,29 @@ class WeightPredictorTrainer:
             'avg_best_score': training_df['best_score'].mean(),
             'score_by_weights': {}
         }
+        
+        # Add classification-specific analysis
+        if model_type == "classification":
+            training_df = self._add_weight_classes(training_df)
+            class_dist = training_df['weight_class'].value_counts().sort_index()
+            
+            analysis['class_distribution'] = {
+                f"{CLASS_TO_WEIGHTS[i][0]}/{CLASS_TO_WEIGHTS[i][1]}": count 
+                for i, count in class_dist.items()
+            }
+            analysis['class_balance'] = class_dist.min() / class_dist.max() if len(class_dist) > 0 else 0
+            
+            # Analyze scores by weight class
+            score_by_class = {}
+            for class_id in range(len(WEIGHT_CLASSES)):
+                class_data = training_df[training_df['weight_class'] == class_id]
+                if len(class_data) > 0:
+                    score_by_class[f"{CLASS_TO_WEIGHTS[class_id][0]}/{CLASS_TO_WEIGHTS[class_id][1]}"] = {
+                        'mean_score': class_data['best_score'].mean(),
+                        'std_score': class_data['best_score'].std(),
+                        'count': len(class_data)
+                    }
+            analysis['score_by_class'] = score_by_class
         
         # Analyze average score for each weight combination
         for _, row in training_df.iterrows():
@@ -449,6 +697,13 @@ def main():
                        help='Step size for weight grid (default: 0.1)')
     parser.add_argument('--training-data-file', default=None,
                        help='Save/load training data to/from this file')
+    parser.add_argument('--model-type', choices=['regression', 'classification'], 
+                       default='regression',
+                       help='Type of model to train (default: regression)')
+    parser.add_argument('--no-polynomial', action='store_true',
+                       help='Disable polynomial feature creation (for classification)')
+    parser.add_argument('--use-basic-features', action='store_true',
+                       help='Use only basic features for ESCI dataset')
     
     args = parser.parse_args()
     
@@ -457,7 +712,8 @@ def main():
         host=args.host,
         port=args.port,
         index_name=args.index,
-        model_id=args.model_id
+        model_id=args.model_id,
+        use_basic_features=args.use_basic_features
     )
     
     # Check if we have saved training data
@@ -516,7 +772,7 @@ def main():
     
     # Analyze training data
     logger.info("\n=== Training Data Analysis ===")
-    analysis = trainer.analyze_training_data(training_df)
+    analysis = trainer.analyze_training_data(training_df, model_type=args.model_type)
     
     print(f"Total training examples: {analysis['total_examples']}")
     
@@ -544,33 +800,66 @@ def main():
             logger.error(f"Failed to get index stats: {e}")
         
         sys.exit(1)
-    print("\nOptimal weight distribution:")
-    for (lex, neural), count in sorted(analysis['weight_distribution'].items()):
-        print(f"  {lex}/{neural}: {count} queries")
     
-    print(f"\nAverage best score: {analysis['avg_best_score']:.4f}")
+    print(f"Average best score: {analysis['avg_best_score']:.4f}")
+    
+    if args.model_type == "classification":
+        print(f"Class balance ratio: {analysis.get('class_balance', 0):.2f}")
+        print("\nClass distribution:")
+        for weights, count in analysis.get('class_distribution', {}).items():
+            print(f"  {weights}: {count} queries")
+        
+        print("\nAverage scores by class:")
+        for weights, stats in analysis.get('score_by_class', {}).items():
+            print(f"  {weights}: {stats['mean_score']:.4f} (±{stats['std_score']:.4f})")
+    else:
+        print("\nOptimal weight distribution:")
+        for (lex, neural), count in sorted(analysis['weight_distribution'].items()):
+            print(f"  {lex}/{neural}: {count} queries")
     
     print("\nAverage scores by weight combination:")
     for weight_str, stats in sorted(analysis['score_by_weights'].items()):
         print(f"  {weight_str}: {stats['avg_score']:.4f} (±{stats['std_score']:.4f})")
     
     # Train model
-    model_dict = trainer.train_model(training_df)
+    model_dict = trainer.train_model(
+        training_df, 
+        model_type=args.model_type,
+        use_polynomial_features=not args.no_polynomial if args.model_type == "classification" else False
+    )
     
     # Save model
     trainer.save_model(model_dict, args.output)
     
     # Print summary
     print("\n=== Model Training Summary ===")
+    print(f"Model type: {args.model_type}")
     print(f"Features used: {len(model_dict['feature_columns'])}")
-    print(f"Training R²: {model_dict['metrics']['train_r2']:.4f}")
-    print(f"Test R²: {model_dict['metrics']['test_r2']:.4f}")
+    
+    if args.model_type == "classification":
+        if model_dict.get('poly_transformer'):
+            print(f"Polynomial features: Enabled (degree=2, interaction_only=True)")
+        print(f"Training accuracy: {model_dict['metrics']['train_accuracy']:.4f}")
+        print(f"Test accuracy: {model_dict['metrics']['test_accuracy']:.4f}")
+        print(f"Cross-validation accuracy: {model_dict['metrics']['cv_accuracy_mean']:.4f} "
+              f"(+/- {model_dict['metrics']['cv_accuracy_std']*2:.4f})")
+        if args.model_type == "classification":
+            print(f"\nJava parameters saved to: {args.output.replace('.pkl', '_java_params.json')}")
+    else:
+        print(f"Training R²: {model_dict['metrics']['train_r2']:.4f}")
+        print(f"Test R²: {model_dict['metrics']['test_r2']:.4f}")
+    
     print(f"\nModel saved to: {args.output}")
     
-    # Create a simple usage example
-    print("\nTo use the trained model, update weight_predictor.py:")
-    print("1. Load the model: model_dict = pickle.load(open('{}', 'rb'))".format(args.output))
-    print("2. Use in MLWeightPredictor class for predictions")
+    # Usage instructions
+    print("\n=== Usage Instructions ===")
+    print("To use this model in evaluation:")
+    print(f"python dynamic_hybrid/evaluate_dynamic_hybrid_standalone.py \\")
+    print(f"  -d {args.dataset} -u {args.url} \\")
+    print(f"  --host {args.host} -p {args.port} \\")
+    print(f"  -i {args.index} -m {args.model_id} \\")
+    print(f"  --use-ml --weight-predictor-model {args.output} \\")
+    print(f"  -o evaluation_results.json")
 
 
 if __name__ == "__main__":
