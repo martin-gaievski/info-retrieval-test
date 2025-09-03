@@ -83,7 +83,8 @@ class CorpusAwareWeightPredictorTrainer:
                             data_path: str,
                             weight_values: List[float] = None,
                             sample_size: Optional[int] = None,
-                            include_result_features: bool = False) -> pd.DataFrame:
+                            include_result_features: bool = False,
+                            extraction_method: str = 'corpus') -> pd.DataFrame:
         """
         Collect training data by evaluating queries with different weights.
         
@@ -124,16 +125,51 @@ class CorpusAwareWeightPredictorTrainer:
             queries = {qid: queries[qid] for qid in query_ids}
             logger.info(f"Sampled {sample_size} queries for training (seed: {self.random_seed})")
         
-        # Initialize feature extractor with corpus awareness
+        # Initialize feature extractor based on chosen method
+        logger.info(f"Using {extraction_method} feature extraction method")
+        
         if dataset_name.lower() == "esci":
-            feature_extractor = ESCICorpusAwareFeatureExtractor(
-                client=self.client,
-                index_name=self.index_name,
-                cache_term_stats=self.cache_term_stats
-            )
-            logger.info("Using ESCICorpusAwareFeatureExtractor")
+            if extraction_method == 'corpus':
+                # Corpus-aware approach using termvectors API
+                feature_extractor = ESCICorpusAwareFeatureExtractor(
+                    client=self.client,
+                    index_name=self.index_name,
+                    cache_term_stats=self.cache_term_stats
+                )
+                logger.info("Using ESCICorpusAwareFeatureExtractor (termvectors API)")
+                
+            elif extraction_method == 'o19s':
+                # O19S search result-based approach
+                from o19s_validation_implementation import O19SResultFeatureExtractor
+                from beir.hybrid.search import RetrievalOpenSearch
+                
+                searcher = RetrievalOpenSearch(
+                    endpoint=args.host if 'args' in locals() else 'localhost',
+                    port=str(args.port) if 'args' in locals() else '9200',
+                    index_name=self.index_name,
+                    model_id=self.model_id,
+                    search_method="hybrid"
+                )
+                
+                feature_extractor = O19SResultFeatureExtractor(searcher)
+                logger.info("Using O19SResultFeatureExtractor (query + search results only)")
+                
+            elif extraction_method == 'corpus_search':
+                # O19S-compatible search-based approach
+                from feature_extractor_o19s_compatible import O19SCompatibleFeatureExtractor
+                
+                feature_extractor = O19SCompatibleFeatureExtractor(
+                    client=self.client,
+                    index_name=self.index_name,
+                    model_id=self.model_id
+                )
+                logger.info("Using O19SCompatibleFeatureExtractor (search-based, no termvectors)")
+                
+            else:
+                raise ValueError(f"Unknown extraction method: {extraction_method}")
+                
         else:
-            # Use generic corpus-aware extractor
+            # Use generic corpus-aware extractor for non-ESCI datasets
             feature_extractor = CorpusAwareFeatureExtractor(
                 client=self.client,
                 index_name=self.index_name,
@@ -550,6 +586,10 @@ def main():
                        help='Disable caching of term statistics')
     parser.add_argument('--seed', type=int, default=42,
                        help='Random seed for training query selection')
+    parser.add_argument('--extraction-method', 
+                       choices=['corpus', 'o19s', 'corpus_search'],
+                       default='corpus',
+                       help='Feature extraction method: corpus (termvectors), o19s (search results), corpus_search (search-based)')
     
     args = parser.parse_args()
     
@@ -591,7 +631,8 @@ def main():
             data_path,
             weight_values=args.weight_values,
             sample_size=args.sample_size,
-            include_result_features=args.include_result_features
+            include_result_features=args.include_result_features,
+            extraction_method=args.extraction_method
         )
         
         # Save training data if requested

@@ -240,6 +240,39 @@ class ESCICorpusAwareFeatureExtractor(CorpusAwareFeatureExtractor):
         # ESCI-specific patterns
         self.size_patterns = re.compile(r'\b(\d+(?:\.\d+)?)\s*(gb|mb|tb|kg|g|mg|ml|l|oz|lb|inch|in|cm|mm|m)\b', re.IGNORECASE)
         self.model_number_pattern = re.compile(r'\b[A-Z0-9]{3,}[-]?[A-Z0-9]+\b')
+        
+        # Define feature names for compatibility with O19S validation framework
+        self.feature_names = [
+            # Query string features
+            'query_length',
+            'num_terms',
+            'has_numbers',
+            'has_special_chars',
+            'unique_terms_ratio',
+            'stopword_ratio',
+            'capitalization_ratio',
+            'has_punctuation',
+            
+            # ESCI-specific features
+            'has_size_specification',
+            'has_model_number',
+            
+            # Corpus-based features (document frequency)
+            'max_document_frequency',
+            'min_document_frequency',
+            'total_document_frequency',
+            'average_document_frequency',
+            'variance_document_frequency',
+            'std_dev_document_frequency',
+            
+            # Corpus-based features (inverse document frequency)
+            'max_inverse_document_frequency',
+            'min_inverse_document_frequency',
+            'total_inverse_document_frequency',
+            'average_inverse_document_frequency',
+            'variance_inverse_document_frequency',
+            'std_dev_inverse_document_frequency'
+        ]
     
     def _extract_query_features(self, query: str) -> Dict[str, float]:
         """Extract query features with ESCI-specific additions"""

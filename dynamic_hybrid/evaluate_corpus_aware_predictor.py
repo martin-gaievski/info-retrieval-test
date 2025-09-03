@@ -83,7 +83,12 @@ class CorpusAwareEvaluator:
                 dataset_name: str,
                 data_path: str,
                 weight_values: List[float] = None,
-                sample_size: Optional[int] = None) -> Tuple[pd.DataFrame, Dict]:
+                sample_size: Optional[int] = None,
+                seed: int = 42,
+                train_ratio: float = 0.8,
+                use_test_split: bool = False,
+                host: str = "localhost",
+                port: int = 9200) -> Tuple[pd.DataFrame, Dict]:
         """
         Evaluate the model on a dataset
         
@@ -116,20 +121,36 @@ class CorpusAwareEvaluator:
         # Sample queries if requested
         if sample_size and sample_size < len(queries):
             query_ids = list(queries.keys())
-            np.random.seed(42)
+            np.random.seed(seed)
             np.random.shuffle(query_ids)
-            query_ids = query_ids[:sample_size]
+            
+            if use_test_split:
+                # Use test split (last portion) to avoid overlap with training
+                total_queries = len(query_ids)
+                train_size = int(total_queries * train_ratio)
+                test_start = train_size
+                test_end = min(test_start + sample_size, total_queries)
+                query_ids = query_ids[test_start:test_end]
+                logger.info(f"Using test split: queries {test_start+1}-{test_end} of {total_queries} (seed: {seed})")
+                logger.info(f"Training would use queries 1-{train_size}, ensuring no overlap")
+            else:
+                # Random sampling (original behavior)
+                query_ids = query_ids[:sample_size]
+                logger.info(f"Sampled {sample_size} queries for evaluation (random, seed: {seed})")
+                logger.info("WARNING: May overlap with training data if same seed was used for training")
+            
             queries = {qid: queries[qid] for qid in query_ids}
-            logger.info(f"Sampled {sample_size} queries for evaluation")
         
-        # Initialize feature extractor
+        # Initialize feature extractor - use O19S compatible approach instead of O19S result extractor to avoid import issues
         if dataset_name.lower() == "esci":
-            feature_extractor = ESCICorpusAwareFeatureExtractor(
+            from feature_extractor_o19s_compatible import O19SCompatibleFeatureExtractor
+            
+            feature_extractor = O19SCompatibleFeatureExtractor(
                 client=self.client,
                 index_name=self.index_name,
-                cache_term_stats=self.cache_term_stats
+                model_id=self.model_id
             )
-            logger.info("Using ESCICorpusAwareFeatureExtractor")
+            logger.info("Using O19SCompatibleFeatureExtractor (search-based, no termvectors API)")
         else:
             feature_extractor = CorpusAwareFeatureExtractor(
                 client=self.client,
@@ -194,7 +215,7 @@ class CorpusAwareEvaluator:
         results_df = pd.DataFrame(results)
         
         # Calculate summary statistics
-        summary = self._calculate_summary(results_df, weight_values)
+        summary = self._calculate_summary(results_df, weight_values, seed)
         
         return results_df, summary
     
@@ -354,10 +375,11 @@ class CorpusAwareEvaluator:
         return dcg / idcg if idcg > 0 else 0.0
     
     def _calculate_summary(self, results_df: pd.DataFrame, 
-                          weight_values: List[float]) -> Dict:
+                          weight_values: List[float], seed: int = 42) -> Dict:
         """Calculate summary statistics"""
         summary = {
             'num_queries': len(results_df),
+            'random_seed': seed,
             'avg_predicted_weight': results_df['predicted_weight'].mean() if 'predicted_weight' in results_df else None,
             'avg_oracle_weight': results_df['oracle_weight'].mean(),
             'avg_ndcg_predicted': results_df['ndcg_predicted'].mean() if 'ndcg_predicted' in results_df else None,
@@ -405,6 +427,12 @@ def main():
                        help='Output file for results')
     parser.add_argument('--no-cache', action='store_true',
                        help='Disable caching of term statistics')
+    parser.add_argument('--seed', type=int, default=42,
+                       help='Random seed for query sampling (default: 42)')
+    parser.add_argument('--train-ratio', type=float, default=0.8,
+                       help='Ratio used for training split to ensure non-overlapping test set (default: 0.8)')
+    parser.add_argument('--use-test-split', action='store_true',
+                       help='Use test split (last 20%) instead of random sampling to avoid overlap with training')
     
     args = parser.parse_args()
     
@@ -440,7 +468,12 @@ def main():
         args.dataset,
         data_path,
         weight_values=args.weight_values,
-        sample_size=args.sample_size
+        sample_size=args.sample_size,
+        seed=args.seed,
+        train_ratio=args.train_ratio,
+        use_test_split=args.use_test_split,
+        host=args.host,
+        port=args.port
     )
     
     # Print summary

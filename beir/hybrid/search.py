@@ -225,6 +225,192 @@ class RetrievalOpenSearch:
     """
         Function works with vector based searches, knn/neural and hybrid
     """
+    def search_hybrid(self, query: str, neural_weight: float = 0.5, top_k: int = 100) -> Dict[str, float]:
+        """Search using hybrid approach with dynamic neural weight."""
+        try:
+            # Use inline search pipeline instead of pre-defined pipeline
+            lexical_weight = 1.0 - neural_weight
+            
+            body = {
+                'size': top_k,
+                '_source': {
+                    'exclude': ['title_embedding']
+                },
+                'query': {
+                    "hybrid": {
+                        "queries": [
+ #                           {
+ #                               'multi_match': {
+ #                                   'query': query,
+ #                                   'type': 'best_fields',
+ #                                   'fields': ['product_title', 'product_description', 'product_brand', 'product_bullet_points'],
+ #                                   "tie_breaker": 0.5
+ #                               }
+ #                           },
+                            {
+                                'multi_match': {
+                                    'type': 'best_fields',
+                                    'fields': [
+                                        'product_id^100',
+                                        'product_bullet_point^3', 
+                                        'product_color^2',
+                                        'product_brand^5',
+                                        'product_description',
+                                        'product_title^10'
+                                    ],
+                                    "operator": 'and',
+                                    "query": query
+                                }
+                            },
+                            {
+                                'neural': {
+                                    'title_embedding': {
+                                        'query_text': query,
+                                        'model_id': self.model_id,
+                                        'k': top_k
+                                    }
+                                }
+                            }
+                        ]
+                    }
+                },
+                "search_pipeline": {
+                    "description": "Dynamic post processor for hybrid search",
+                    "phase_results_processors": [
+                        {
+                            "normalization-processor": {
+                                "normalization": {
+                                    "technique": "min_max"
+                                },
+                                "combination": {
+                                    "technique": "arithmetic_mean",
+                                    "parameters": {
+                                        "weights": [lexical_weight, neural_weight]
+                                    }
+                                }
+                            }
+                        }
+                    ]
+                }
+            }
+            
+            # Execute hybrid search with inline pipeline (no search_params needed)
+            response = self.opensearch.search(
+                index=self.index_name,
+                body=body
+            )
+            
+            # Extract results
+            results = {}
+            for hit in response['hits']['hits']:
+                doc_id = hit['_id']
+                score = hit['_score']
+                results[doc_id] = score
+            
+            return results
+            
+        except Exception as e:
+            logger.error(f"Error in hybrid search: {e}")
+            # Fallback to combining BM25 and neural results
+            return self._fallback_hybrid_search(query, neural_weight, top_k)
+    
+    def _fallback_hybrid_search(self, query: str, neural_weight: float, top_k: int) -> Dict[str, float]:
+        """Fallback hybrid search by combining BM25 and neural results."""
+        try:
+            bm25_results = self.search_bm25_single(query, top_k)
+            neural_results = self.search_neural_single(query, top_k)
+            
+            # Combine results with weights
+            combined_scores = {}
+            
+            # Add BM25 scores
+            for doc_id, score in bm25_results.items():
+                combined_scores[doc_id] = (1 - neural_weight) * score
+            
+            # Add neural scores
+            for doc_id, score in neural_results.items():
+                if doc_id in combined_scores:
+                    combined_scores[doc_id] += neural_weight * score
+                else:
+                    combined_scores[doc_id] = neural_weight * score
+            
+            # Return top-k results
+            sorted_results = sorted(combined_scores.items(), key=lambda x: x[1], reverse=True)
+            return dict(sorted_results[:top_k])
+        except Exception as e:
+            logger.error(f"Error in fallback hybrid search: {e}")
+            return {}
+    
+    def search_bm25_single(self, query: str, top_k: int = 100) -> Dict[str, float]:
+        """Search using BM25 only - single query version."""
+        try:
+            body = {
+                'size': top_k,
+                '_source': {
+                    'exclude': ['title_embedding']
+                },
+                'query': {
+                    'multi_match': {
+                        'query': query,
+                        'type': 'best_fields',
+                        'fields': ['product_title', 'product_description', 'product_brand', 'product_bullet_points'],
+                        "tie_breaker": 0.5
+                    }
+                }
+            }
+            
+            response = self.opensearch.search(
+                index=self.index_name,
+                body=body
+            )
+            
+            # Extract results
+            results = {}
+            for hit in response['hits']['hits']:
+                doc_id = hit['_id']
+                score = hit['_score']
+                results[doc_id] = score
+            
+            return results
+            
+        except Exception as e:
+            logger.error(f"Error in BM25 search: {e}")
+            return {}
+    
+    def search_neural_single(self, query: str, top_k: int = 100) -> Dict[str, float]:
+        """Search using neural search only - single query version."""
+        try:
+            body = {
+                'size': top_k,
+                'query': {
+                    'neural': {
+                        'title_embedding': {
+                            'query_text': query,
+                            'model_id': self.model_id,
+                            'k': top_k
+                        }
+                    }
+                }
+            }
+            
+            response = self.opensearch.search(
+                index=self.index_name,
+                body=body
+            )
+            
+            # Extract results
+            results = {}
+            for hit in response['hits']['hits']:
+                doc_id = hit['_id']
+                score = hit['_score']
+                results[doc_id] = score
+            
+            return results
+            
+        except Exception as e:
+            logger.error(f"Error in neural search: {e}")
+            return {}
+
     def search_vector(self,
                       corpus: Dict[str, Dict[str, str]],
                       queries: Dict[str, str],

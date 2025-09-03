@@ -14,6 +14,31 @@ class EvaluateRetrieval:
         self.k_values = k_values
         self.top_k = max(k_values)
         self.retriever = retriever
+    
+    def calculate_ndcg(self, results: Dict[str, float], qrels: Dict[str, int], k: int = 10) -> float:
+        """Calculate NDCG@k for search results."""
+        if not results or not qrels:
+            return 0.0
+        
+        # Get top-k results
+        sorted_results = sorted(results.items(), key=lambda x: x[1], reverse=True)[:k]
+        
+        # Calculate DCG
+        dcg = 0.0
+        for i, (doc_id, score) in enumerate(sorted_results):
+            relevance = qrels.get(doc_id, 0)
+            if relevance > 0:
+                dcg += (2**relevance - 1) / np.log2(i + 2)
+        
+        # Calculate IDCG (ideal DCG)
+        ideal_relevances = sorted(qrels.values(), reverse=True)[:k]
+        idcg = 0.0
+        for i, relevance in enumerate(ideal_relevances):
+            if relevance > 0:
+                idcg += (2**relevance - 1) / np.log2(i + 2)
+        
+        # Return NDCG
+        return dcg / idcg if idcg > 0 else 0.0
 
     @staticmethod
     def evaluate(qrels: Dict[str, Dict[str, int]],
