@@ -232,47 +232,100 @@ class ESCICorpusAwareFeatureExtractor(CorpusAwareFeatureExtractor):
     """
     ESCI-specific corpus-aware feature extractor.
     Uses product_title field by default and includes ESCI-specific patterns.
+    Supports configurable feature sets for O19S compatibility.
     """
     
-    def __init__(self, client: OpenSearch, index_name: str = "esci_products", cache_term_stats: bool = True):
+    def __init__(self, client: OpenSearch, index_name: str = "esci_products", 
+                 cache_term_stats: bool = True, feature_set: str = "full"):
         super().__init__(client, index_name, field_name="product_title", cache_term_stats=cache_term_stats)
+        self.feature_set = feature_set
         
         # ESCI-specific patterns
         self.size_patterns = re.compile(r'\b(\d+(?:\.\d+)?)\s*(gb|mb|tb|kg|g|mg|ml|l|oz|lb|inch|in|cm|mm|m)\b', re.IGNORECASE)
         self.model_number_pattern = re.compile(r'\b[A-Z0-9]{3,}[-]?[A-Z0-9]+\b')
         
-        # Define feature names for compatibility with O19S validation framework
-        self.feature_names = [
-            # Query string features
-            'query_length',
-            'num_terms',
-            'has_numbers',
-            'has_special_chars',
-            'unique_terms_ratio',
-            'stopword_ratio',
-            'capitalization_ratio',
-            'has_punctuation',
-            
-            # ESCI-specific features
-            'has_size_specification',
-            'has_model_number',
-            
-            # Corpus-based features (document frequency)
-            'max_document_frequency',
-            'min_document_frequency',
-            'total_document_frequency',
-            'average_document_frequency',
-            'variance_document_frequency',
-            'std_dev_document_frequency',
-            
-            # Corpus-based features (inverse document frequency)
-            'max_inverse_document_frequency',
-            'min_inverse_document_frequency',
-            'total_inverse_document_frequency',
-            'average_inverse_document_frequency',
-            'variance_inverse_document_frequency',
-            'std_dev_inverse_document_frequency'
-        ]
+        # Define feature sets
+        if feature_set == "o19s":
+            # O19S-compatible feature set (15 features - matches their corpus approach)
+            self.feature_names = [
+                # Core query features that O19S uses
+                'query_length',
+                'has_special_chars',
+                'has_punctuation',
+                'capitalization_ratio', 
+                'stopword_ratio',
+                
+                # All corpus-based features (document frequency)
+                'max_document_frequency',
+                'min_document_frequency',
+                'total_document_frequency',
+                'average_document_frequency',
+                'variance_document_frequency',
+                'std_dev_document_frequency',
+                
+                # All corpus-based features (inverse document frequency)
+                'max_inverse_document_frequency',
+                'min_inverse_document_frequency',
+                'total_inverse_document_frequency',
+                'average_inverse_document_frequency',
+                'variance_inverse_document_frequency',
+                'std_dev_inverse_document_frequency'
+            ]
+        else:
+            # Full feature set (22 features - my enhanced approach)
+            self.feature_names = [
+                # Query string features
+                'query_length',
+                'num_terms',
+                'has_numbers',
+                'has_special_chars',
+                'unique_terms_ratio',
+                'stopword_ratio',
+                'capitalization_ratio',
+                'has_punctuation',
+                
+                # ESCI-specific features
+                'has_size_specification',
+                'has_model_number',
+                
+                # Corpus-based features (document frequency)
+                'max_document_frequency',
+                'min_document_frequency',
+                'total_document_frequency',
+                'average_document_frequency',
+                'variance_document_frequency',
+                'std_dev_document_frequency',
+                
+                # Corpus-based features (inverse document frequency)
+                'max_inverse_document_frequency',
+                'min_inverse_document_frequency',
+                'total_inverse_document_frequency',
+                'average_inverse_document_frequency',
+                'variance_inverse_document_frequency',
+                'std_dev_inverse_document_frequency'
+            ]
+    
+    def extract_features(self, query: str) -> Dict[str, float]:
+        """Extract features based on configured feature set"""
+        all_features = {}
+        
+        # Extract all available features
+        query_features = self._extract_query_features(query)
+        all_features.update(query_features)
+        
+        corpus_features = self._extract_corpus_features(query)
+        all_features.update(corpus_features)
+        
+        # Filter to only include features in the selected set
+        selected_features = {}
+        for feature_name in self.feature_names:
+            if feature_name in all_features:
+                selected_features[feature_name] = all_features[feature_name]
+            else:
+                # Set to 0 if feature not available
+                selected_features[feature_name] = 0.0
+                
+        return selected_features
     
     def _extract_query_features(self, query: str) -> Dict[str, float]:
         """Extract query features with ESCI-specific additions"""

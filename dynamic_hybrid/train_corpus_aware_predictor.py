@@ -84,7 +84,8 @@ class CorpusAwareWeightPredictorTrainer:
                             weight_values: List[float] = None,
                             sample_size: Optional[int] = None,
                             include_result_features: bool = False,
-                            extraction_method: str = 'corpus') -> pd.DataFrame:
+                            extraction_method: str = 'corpus',
+                            feature_set: str = 'full') -> pd.DataFrame:
         """
         Collect training data by evaluating queries with different weights.
         
@@ -94,6 +95,8 @@ class CorpusAwareWeightPredictorTrainer:
             weight_values: List of neural weight values to test (default: 0.0 to 1.0 by 0.1)
             sample_size: Number of queries to sample (None for all)
             include_result_features: Whether to include search result features
+            extraction_method: Feature extraction method to use
+            feature_set: Feature set to use ('full' or 'o19s')
             
         Returns:
             DataFrame with features and optimal weights
@@ -126,7 +129,7 @@ class CorpusAwareWeightPredictorTrainer:
             logger.info(f"Sampled {sample_size} queries for training (seed: {self.random_seed})")
         
         # Initialize feature extractor based on chosen method
-        logger.info(f"Using {extraction_method} feature extraction method")
+        logger.info(f"Using {extraction_method} feature extraction method with {feature_set} feature set")
         
         if dataset_name.lower() == "esci":
             if extraction_method == 'corpus':
@@ -134,9 +137,10 @@ class CorpusAwareWeightPredictorTrainer:
                 feature_extractor = ESCICorpusAwareFeatureExtractor(
                     client=self.client,
                     index_name=self.index_name,
-                    cache_term_stats=self.cache_term_stats
+                    cache_term_stats=self.cache_term_stats,
+                    feature_set=feature_set
                 )
-                logger.info("Using ESCICorpusAwareFeatureExtractor (termvectors API)")
+                logger.info(f"Using ESCICorpusAwareFeatureExtractor (termvectors API) with {feature_set} features")
                 
             elif extraction_method == 'o19s':
                 # O19S search result-based approach
@@ -144,8 +148,8 @@ class CorpusAwareWeightPredictorTrainer:
                 from beir.hybrid.search import RetrievalOpenSearch
                 
                 searcher = RetrievalOpenSearch(
-                    endpoint=args.host if 'args' in locals() else 'localhost',
-                    port=str(args.port) if 'args' in locals() else '9200',
+                    endpoint='localhost',  # Will be overridden by actual args
+                    port='9200',
                     index_name=self.index_name,
                     model_id=self.model_id,
                     search_method="hybrid"
@@ -590,6 +594,10 @@ def main():
                        choices=['corpus', 'o19s', 'corpus_search'],
                        default='corpus',
                        help='Feature extraction method: corpus (termvectors), o19s (search results), corpus_search (search-based)')
+    parser.add_argument('--feature-set',
+                       choices=['full', 'o19s'],
+                       default='full',
+                       help='Feature set to use: full (22 features) or o19s (15 features, matches O19S exactly)')
     
     args = parser.parse_args()
     
@@ -632,7 +640,8 @@ def main():
             weight_values=args.weight_values,
             sample_size=args.sample_size,
             include_result_features=args.include_result_features,
-            extraction_method=args.extraction_method
+            extraction_method=args.extraction_method,
+            feature_set=args.feature_set
         )
         
         # Save training data if requested
@@ -675,6 +684,7 @@ def main():
     # Print summary
     print("\n=== Model Training Summary ===")
     print(f"Model type: {args.model_type}")
+    print(f"Feature set: {args.feature_set}")
     print(f"Features used: {len(model_dict['feature_columns'])}")
     print(f"Training R²: {model_dict['metrics']['train_r2']:.4f}")
     print(f"Test R²: {model_dict['metrics']['test_r2']:.4f}")

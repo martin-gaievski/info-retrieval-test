@@ -88,7 +88,8 @@ class CorpusAwareEvaluator:
                 train_ratio: float = 0.8,
                 use_test_split: bool = False,
                 host: str = "localhost",
-                port: int = 9200) -> Tuple[pd.DataFrame, Dict]:
+                port: int = 9200,
+                feature_set: str = "full") -> Tuple[pd.DataFrame, Dict]:
         """
         Evaluate the model on a dataset
         
@@ -97,11 +98,17 @@ class CorpusAwareEvaluator:
             data_path: Path to dataset files
             weight_values: List of fixed weights to compare against
             sample_size: Number of queries to evaluate (None for all)
+            seed: Random seed for query sampling
+            train_ratio: Training ratio for test split
+            use_test_split: Whether to use test split to avoid training overlap
+            host: OpenSearch host
+            port: OpenSearch port
+            feature_set: Feature set to use ('full' or 'o19s')
             
         Returns:
             Tuple of (results_df, summary_dict)
         """
-        logger.info(f"Evaluating on dataset: {dataset_name}")
+        logger.info(f"Evaluating on dataset: {dataset_name} with {feature_set} feature set")
         
         # Default weight values for comparison
         if weight_values is None:
@@ -141,16 +148,23 @@ class CorpusAwareEvaluator:
             
             queries = {qid: queries[qid] for qid in query_ids}
         
-        # Initialize feature extractor - use O19S compatible approach instead of O19S result extractor to avoid import issues
+        # Initialize feature extractor to match training approach
         if dataset_name.lower() == "esci":
-            from feature_extractor_o19s_compatible import O19SCompatibleFeatureExtractor
-            
-            feature_extractor = O19SCompatibleFeatureExtractor(
+            # Use ESCICorpusAwareFeatureExtractor with matching feature set
+            feature_extractor = ESCICorpusAwareFeatureExtractor(
                 client=self.client,
                 index_name=self.index_name,
-                model_id=self.model_id
+                cache_term_stats=self.cache_term_stats,
+                feature_set=feature_set
             )
-            logger.info("Using O19SCompatibleFeatureExtractor (search-based, no termvectors API)")
+            logger.info(f"Using ESCICorpusAwareFeatureExtractor with {feature_set} feature set")
+            
+            # Log feature count for verification
+            expected_features = len(feature_extractor.feature_names)
+            model_features = len(self.model_dict['feature_columns']) if self.model_dict else 0
+            logger.info(f"Feature extractor provides {expected_features} features")
+            logger.info(f"Model expects {model_features} features")
+            
         else:
             feature_extractor = CorpusAwareFeatureExtractor(
                 client=self.client,
@@ -216,6 +230,7 @@ class CorpusAwareEvaluator:
         
         # Calculate summary statistics
         summary = self._calculate_summary(results_df, weight_values, seed)
+        summary['feature_set'] = feature_set  # Record which feature set was used
         
         return results_df, summary
     
@@ -223,12 +238,19 @@ class CorpusAwareEvaluator:
         """Predict optimal weight using the trained model"""
         # Prepare features in the correct order
         feature_values = []
+        missing_features = []
+        
         for col in self.model_dict['feature_columns']:
             if col in features:
                 feature_values.append(features[col])
             else:
-                # Handle missing features (e.g., result features)
+                # Handle missing features (log warning)
                 feature_values.append(0.0)
+                missing_features.append(col)
+        
+        # Log missing features for debugging
+        if missing_features:
+            logger.warning(f"Missing features (set to 0.0): {missing_features[:5]}")
         
         # Scale features
         X = np.array(feature_values).reshape(1, -1)
@@ -433,6 +455,10 @@ def main():
                        help='Ratio used for training split to ensure non-overlapping test set (default: 0.8)')
     parser.add_argument('--use-test-split', action='store_true',
                        help='Use test split (last 20%) instead of random sampling to avoid overlap with training')
+    parser.add_argument('--feature-set',
+                       choices=['full', 'o19s'],
+                       default='full',
+                       help='Feature set to use: full (22 features) or o19s (15 features, matches O19S exactly)')
     
     args = parser.parse_args()
     
@@ -473,12 +499,14 @@ def main():
         train_ratio=args.train_ratio,
         use_test_split=args.use_test_split,
         host=args.host,
-        port=args.port
+        port=args.port,
+        feature_set=args.feature_set
     )
     
     # Print summary
     print("\n=== Evaluation Summary ===")
     print(f"Number of queries: {summary['num_queries']}")
+    print(f"Feature set used: {summary['feature_set']}")
     
     if summary['avg_ndcg_predicted'] is not None:
         print(f"\nAverage NDCG@10:")
