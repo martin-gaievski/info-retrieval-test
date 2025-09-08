@@ -12,6 +12,7 @@ Features:
 - Supports both small (~1K) and full (~100K+) dataset versions
 - Tests BM25, neural, and hybrid search functionality
 - Configurable document limits for testing
+- US-only product filtering to match O19S methodology
 
 Usage Examples:
   # Ingest sample data with model
@@ -60,80 +61,56 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Script version for tracking
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 
-def create_esci_index_mapping():
+def load_esci_index_mapping():
     """
-    Create optimized index mapping for ESCI with hybrid search support.
+    Load ESCI index mapping from external JSON file.
     
     Returns:
         dict: OpenSearch index mapping with settings and field definitions
     """
-    return {
-        "settings": {
-            "index": {
-                "number_of_shards": 12,
-                "number_of_replicas": 0,
-                "knn": True,
-                "refresh_interval": "100ms",
-                "default_pipeline": "esci-embedding-pipeline"
-            },
-            "analysis": {
-                "analyzer": {
-                    "esci_analyzer": {
-                        "tokenizer": "standard",
-                        "filter": ["lowercase", "stop"]
-                    }
-                }
-            }
-        },
-        "mappings": {
-            "properties": {
-                "product_title": {
-                    "type": "text",
-                    "analyzer": "esci_analyzer",
-                    "fields": {
-                        "keyword": {
-                            "type": "keyword",
-                            "ignore_above": 256
-                        }
-                    }
-                },
-                "title_embedding": {
-                    "type": "knn_vector",
-                    "dimension": 384,
-                    "method": {
-                        "name": "hnsw",
-                        "space_type": "l2",
-                        "engine": "lucene",
-                        "parameters": {
-                            "ef_construction": 128,
-                            "m": 24
-                        }
-                    }
-                },
-                "product_id": {"type": "keyword"},
-                "product_brand": {
-                    "type": "text", 
-                    "analyzer": "esci_analyzer"
-                },
-                "product_color": {
-                    "type": "text", 
-                    "analyzer": "esci_analyzer"
-                },
-                "product_description": {
-                    "type": "text", 
-                    "analyzer": "esci_analyzer"
-                },
-                "product_locale": {"type": "keyword"},
-                "product_bullet_points": {
-                    "type": "text", 
-                    "analyzer": "esci_analyzer"
-                }
-            }
-        }
-    }
+    mapping_file = os.path.join(os.path.dirname(__file__), 'esci_index_mapping.json')
+    
+    try:
+        with open(mapping_file, 'r') as f:
+            mapping = json.load(f)
+        logger.info(f"Loaded index mapping from {mapping_file}")
+        return mapping
+    except FileNotFoundError:
+        logger.error(f"Index mapping file not found: {mapping_file}")
+        raise
+    except json.JSONDecodeError as e:
+        logger.error(f"Invalid JSON in mapping file: {e}")
+        raise
+
+
+def filter_products_for_o19s_compatibility(corpus):
+    """
+    Filter products to match O19S methodology - US locale only.
+    
+    Args:
+        corpus (dict): Full product corpus
+        
+    Returns:
+        dict: Filtered corpus with US products only
+    """
+    original_count = len(corpus)
+    
+    # Filter for US products only (matching O19S approach)
+    us_corpus = {}
+    for doc_id, doc in corpus.items():
+        if doc.get('product_locale') == 'us':
+            us_corpus[doc_id] = doc
+    
+    filtered_count = len(us_corpus)
+    logger.info(f"Product filtering for O19S compatibility:")
+    logger.info(f"  Total documents before filtering: {original_count}")
+    logger.info(f"  Total documents after filtering (US only): {filtered_count}")
+    logger.info(f"  Filtered out: {original_count - filtered_count} non-US products")
+    
+    return us_corpus
 
 
 def setup_index_with_pipeline(endpoint, port, index_name, model_id):
@@ -172,9 +149,9 @@ def setup_index_with_pipeline(endpoint, port, index_name, model_id):
         logger.info(f"Deleting existing index '{index_name}'")
         client.indices.delete(index=index_name)
     
-    # Create index with optimized mapping
-    logger.info(f"Creating index '{index_name}' with ESCI-optimized mapping")
-    mapping = create_esci_index_mapping()
+    # Create index with mapping from external file
+    logger.info(f"Creating index '{index_name}' with external mapping file")
+    mapping = load_esci_index_mapping()
     client.indices.create(index=index_name, body=mapping)
     
     # Create ML pipeline for automatic embedding generation
@@ -220,13 +197,13 @@ def ingest_esci_data(corpus, endpoint, index, port, model_id):
     Ingest ESCI product data with bulk processing and progress tracking.
     
     Args:
-        corpus (dict): Product data from ESCI loader
+        corpus (dict): Product data from ESCI loader (already US-filtered)
         endpoint (str): OpenSearch host
         index (str): Target index name
         port (int): OpenSearch port
         model_id (str): ML model ID for embeddings
     """
-    logger.info(f"Setting up index and ingesting {len(corpus)} products...")
+    logger.info(f"Setting up index and ingesting {len(corpus)} US products...")
     
     # Setup index with mapping and ML pipeline
     client = setup_index_with_pipeline(endpoint, port, index, model_id)
@@ -484,6 +461,10 @@ Data Files Required:
   esci_data/shopping_queries_dataset_examples_us_small.parquet
 
 For full dataset, use files without '_small' suffix.
+
+O19S Compatibility:
+  - Only US products are ingested (product_locale == 'us')
+  - Index mapping loaded from esci_index_mapping.json
     """)
 
 
@@ -582,7 +563,11 @@ def main():
         corpus, queries, qrels = loader.load(split="test")
         logger.info(f"Loaded {len(corpus)} products, {len(queries)} queries, {len(qrels)} relevance judgments")
         
-        # Apply document limit if specified
+        # Apply O19S product filtering (US locale only)
+        logger.info("Applying O19S-compatible product filtering...")
+        corpus = filter_products_for_o19s_compatibility(corpus)
+        
+        # Apply document limit if specified (after filtering)
         if config['max_documents'] and config['max_documents'] < len(corpus):
             logger.info(f"Limiting corpus to {config['max_documents']} documents")
             corpus_items = list(corpus.items())[:config['max_documents']]

@@ -1,0 +1,64 @@
+{
+  "settings": {
+    "index": {
+      "number_of_shards": 1,
+      "number_of_replicas": 0,
+      "knn": true,
+      "refresh_interval": "100ms",
+      "default_pipeline": "esci-embedding-pipeline"
+    },
+    "analysis": {
+      "analyzer": {
+        "esci_analyzer": {
+          "tokenizer": "standard",
+          "filter": ["lowercase", "stop"]
+        }
+      }
+    }
+  },
+  "mappings": {
+    "properties": {
+      "product_title": {
+        "type": "text",
+        "analyzer": "esci_analyzer",
+        "fields": {
+          "keyword": {
+            "type": "keyword",
+            "ignore_above": 256
+          }
+        }
+      },
+      "title_embedding": {
+        "type": "knn_vector",
+        "dimension": 384,
+        "method": {
+          "name": "hnsw",
+          "space_type": "l2",
+          "engine": "lucene",
+          "parameters": {
+            "ef_construction": 128,
+            "m": 24
+          }
+        }
+      },
+      "product_id": {"type": "keyword"},
+      "product_brand": {
+        "type": "text", 
+        "analyzer": "esci_analyzer"
+      },
+      "product_color": {
+        "type": "text", 
+        "analyzer": "esci_analyzer"
+      },
+      "product_description": {
+        "type": "text", 
+        "analyzer": "esci_analyzer"
+      },
+      "product_locale": {"type": "keyword"},
+      "product_bullet_points": {
+        "type": "text", 
+        "analyzer": "esci_analyzer"
+      }
+    }
+  }
+}

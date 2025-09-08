@@ -5,6 +5,7 @@
 DATASET_NAME=""
 HOST="localhost"
 PORT="9200"
+INDEX_NAME=""
 while [[ $# -gt 0 ]]; do
     case $1 in
         -d|--dataset)
@@ -19,6 +20,10 @@ while [[ $# -gt 0 ]]; do
             PORT="$2"
             shift 2
             ;;
+        -i|--index)
+            INDEX_NAME="$2"
+            shift 2
+            ;;
         --help)
             echo "Usage: $0 [OPTIONS]"
             echo ""
@@ -26,11 +31,13 @@ while [[ $# -gt 0 ]]; do
             echo "  -d, --dataset DATASET    Dataset name (e.g., scifact, scidocs, esci-product)"
             echo "  -h, --host HOST          OpenSearch host (default: localhost)"
             echo "  -p, --port PORT          OpenSearch port (default: 9200)"
+            echo "  -i, --index INDEX        Index name (default: my-nlp-index-1 or esci-products for ESCI)"
             echo "  --help                   Show this help message"
             echo ""
             echo "Example:"
             echo "  $0 --dataset scifact --host myserver.com --port 9201"
             echo "  $0 --dataset esci-product    # Uses special ESCI ingestion script"
+            echo "  $0 --dataset esci-product --index custom-esci-index"
             exit 0
             ;;
         *)
@@ -40,6 +47,15 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# Set default index name based on dataset
+if [ -z "$INDEX_NAME" ]; then
+    if [ "$DATASET_NAME" = "esci-product" ]; then
+        INDEX_NAME="esci-products"
+    else
+        INDEX_NAME="my-nlp-index-1"
+    fi
+fi
 
 # Map dataset names to URLs
 declare -A DATASET_URLS
@@ -53,6 +69,7 @@ DATASET_URLS["arguana"]="https://public.ukp.informatik.tu-darmstadt.de/thakur/BE
 echo "=== OpenSearch Setup for Dynamic Hybrid Search POC ==="
 echo "OpenSearch Host: $HOST"
 echo "OpenSearch Port: $PORT"
+echo "Index Name: $INDEX_NAME"
 if [ -n "$DATASET_NAME" ]; then
     echo "Dataset: $DATASET_NAME"
 fi
@@ -99,12 +116,12 @@ fi
 
 # 3. Check if index exists
 echo ""
-echo "Checking index 'my-nlp-index-1'..."
-if curl -s -o /dev/null -w "%{http_code}" $HOST:$PORT/my-nlp-index-1 2>/dev/null | grep -q 200; then
+echo "Checking index '$INDEX_NAME'..."
+if curl -s -o /dev/null -w "%{http_code}" $HOST:$PORT/$INDEX_NAME 2>/dev/null | grep -q 200; then
     echo -e "${GREEN}✓ Index already exists${NC}"
     
     # Get document count
-    DOC_COUNT=$(curl -s $HOST:$PORT/my-nlp-index-1/_count 2>/dev/null | grep -o '"count":[0-9]*' | cut -d: -f2)
+    DOC_COUNT=$(curl -s $HOST:$PORT/$INDEX_NAME/_count 2>/dev/null | grep -o '"count":[0-9]*' | cut -d: -f2)
     echo "  Document count: $DOC_COUNT"
     
     if [ "$DOC_COUNT" -eq "0" ]; then
@@ -112,49 +129,55 @@ if curl -s -o /dev/null -w "%{http_code}" $HOST:$PORT/my-nlp-index-1 2>/dev/null
     fi
 else
     echo -e "${YELLOW}⚠ Index does not exist${NC}"
-    echo "Creating index with hybrid mappings..."
     
-    # Create index
-    RESPONSE=$(curl -s -X PUT "$HOST:$PORT/my-nlp-index-1" \
-    -H "Content-Type: application/json" \
-    -d '{
-      "settings": {
-        "number_of_shards": 12,
-        "number_of_replicas": 0,
-        "index.knn": true,
-        "default_pipeline": "embeddings-pipeline"
-      },
-      "mappings": {
-        "properties": {
-          "text": {
-            "type": "text",
-            "analyzer": "standard"
+    # For ESCI dataset, let the ingestion script handle index creation with proper mapping
+    if [ "$DATASET_NAME" = "esci-product" ]; then
+        echo "Index will be created by ESCI ingestion script with proper O19S-compatible mapping..."
+    else
+        echo "Creating index with hybrid mappings..."
+        
+        # Create index for non-ESCI datasets
+        RESPONSE=$(curl -s -X PUT "$HOST:$PORT/$INDEX_NAME" \
+        -H "Content-Type: application/json" \
+        -d '{
+          "settings": {
+            "number_of_shards": 12,
+            "number_of_replicas": 0,
+            "index.knn": true,
+            "default_pipeline": "embeddings-pipeline"
           },
-          "title_embedding": {
-            "type": "knn_vector",
-            "dimension": 384,
-            "method": {
-              "name": "hnsw",
-              "space_type": "l2",
-              "engine": "lucene",
-              "parameters": {
-                "ef_construction": 128,
-                "m": 24
+          "mappings": {
+            "properties": {
+              "text": {
+                "type": "text",
+                "analyzer": "standard"
+              },
+              "title_embedding": {
+                "type": "knn_vector",
+                "dimension": 384,
+                "method": {
+                  "name": "hnsw",
+                  "space_type": "l2",
+                  "engine": "lucene",
+                  "parameters": {
+                    "ef_construction": 128,
+                    "m": 24
+                  }
+                }
+              },
+              "product_title": {
+                "type": "text"
               }
             }
-          },
-          "product_title": {
-            "type": "text"
           }
-        }
-      }
-    }')
-    
-    if echo "$RESPONSE" | grep -q '"acknowledged":true'; then
-        echo -e "${GREEN}✓ Index created successfully${NC}"
-    else
-        echo -e "${RED}✗ Failed to create index${NC}"
-        echo "Response: $RESPONSE"
+        }')
+        
+        if echo "$RESPONSE" | grep -q '"acknowledged":true'; then
+            echo -e "${GREEN}✓ Index created successfully${NC}"
+        else
+            echo -e "${RED}✗ Failed to create index${NC}"
+            echo "Response: $RESPONSE"
+        fi
     fi
 fi
 
@@ -313,31 +336,104 @@ echo -e "${GREEN}✓ Model setup complete!${NC}"
 echo "  Model ID: $model_id"
 echo "  Model Group ID: $model_group_id"
 
-# 5. Test hybrid query capability
+# Ingest dataset immediately if index doesn't exist and dataset is specified
+echo ""
+echo "Checking if data ingestion is needed..."
+DOC_COUNT=$(curl -s $HOST:$PORT/$INDEX_NAME/_count 2>/dev/null | grep -o '"count":[0-9]*' | cut -d: -f2)
+
+if [ -z "$DOC_COUNT" ] || [ "$DOC_COUNT" -eq "0" ]; then
+    if [ -n "$DATASET_NAME" ]; then
+        # Special handling for esci-product dataset
+        if [ "$DATASET_NAME" = "esci-product" ]; then
+            echo -e "${MAJOR}Ingesting ESCI product dataset with O19S-compatible US-only filtering...${RESET}"
+            echo "Running: python3 dynamic_hybrid/esci_ingestion.py -m $model_id -h $HOST -p $PORT -i $INDEX_NAME"
+            
+            python3 dynamic_hybrid/esci_ingestion.py -m "$model_id" -h "$HOST" -p "$PORT" -i "$INDEX_NAME"
+            
+            if [ $? -eq 0 ]; then
+                echo -e "${GREEN}✓ ESCI dataset ingestion completed${NC}"
+                
+                # Check document count again
+                DOC_COUNT=$(curl -s $HOST:$PORT/$INDEX_NAME/_count 2>/dev/null | grep -o '"count":[0-9]*' | cut -d: -f2)
+                echo "  Document count after ingestion: $DOC_COUNT"
+            else
+                echo -e "${RED}✗ ESCI dataset ingestion failed${NC}"
+                echo "Please check the error messages above"
+                exit 1
+            fi
+        else
+            # Check if dataset URL exists
+            if [ -z "${DATASET_URLS[$DATASET_NAME]}" ]; then
+                echo -e "${RED}✗ Unknown dataset: $DATASET_NAME${NC}"
+                echo "Supported datasets: ${!DATASET_URLS[@]} esci-product"
+                exit 1
+            fi
+            
+            DATASET_URL="${DATASET_URLS[$DATASET_NAME]}"
+            echo -e "${MAJOR}Ingesting $DATASET_NAME dataset...${RESET}"
+            echo "Running: python3 test_opensearch_3.py -d $DATASET_NAME -u $DATASET_URL -h $HOST -p $PORT -i $INDEX_NAME -o ingest"
+            
+            python3 test_opensearch_3.py \
+                -d "$DATASET_NAME" \
+                -u "$DATASET_URL" \
+                -h $HOST \
+                -p $PORT \
+                -i $INDEX_NAME \
+                -o ingest
+            
+            if [ $? -eq 0 ]; then
+                echo -e "${GREEN}✓ Dataset ingestion completed${NC}"
+                
+                # Check document count again
+                DOC_COUNT=$(curl -s $HOST:$PORT/$INDEX_NAME/_count 2>/dev/null | grep -o '"count":[0-9]*' | cut -d: -f2)
+                echo "  Document count after ingestion: $DOC_COUNT"
+            else
+                echo -e "${RED}✗ Dataset ingestion failed${NC}"
+                echo "Please check the error messages above"
+                exit 1
+            fi
+        fi
+    else
+        echo -e "${YELLOW}⚠ No dataset specified for ingestion. Skipping data loading.${NC}"
+        echo "  Use -d/--dataset parameter to specify a dataset for automatic ingestion"
+    fi
+else
+    echo -e "${GREEN}✓ Index already contains $DOC_COUNT documents${NC}"
+fi
+
+# 5. Test hybrid query capability (AFTER data ingestion)
 echo ""
 echo "Testing hybrid query..."
 
 # Use the model we just deployed
 if [ -n "$model_id" ]; then
-    TEST_RESPONSE=$(curl -s -X POST "$HOST:$PORT/my-nlp-index-1/_search" \
-    -H "Content-Type: application/json" \
-    -d "{
-      \"size\": 1,
-      \"query\": {
-        \"hybrid\": {
-          \"queries\": [
-            {\"match\": {\"passage_text\": \"test\"}},
-            {\"neural\": {\"title_embedding\": {\"query_text\": \"test\", \"model_id\": \"$model_id\", \"k\": 1}}}
-          ]
-        }
-      }
-    }" 2>/dev/null)
+    # First check if index exists and has data
+    CURRENT_DOC_COUNT=$(curl -s $HOST:$PORT/$INDEX_NAME/_count 2>/dev/null | grep -o '"count":[0-9]*' | cut -d: -f2)
     
-    if echo "$TEST_RESPONSE" | grep -q '"hits"'; then
-        echo -e "${GREEN}✓ Hybrid query is working${NC}"
+    if [ -n "$CURRENT_DOC_COUNT" ] && [ "$CURRENT_DOC_COUNT" -gt "0" ]; then
+        TEST_RESPONSE=$(curl -s -X POST "$HOST:$PORT/$INDEX_NAME/_search" \
+        -H "Content-Type: application/json" \
+        -d "{
+          \"size\": 1,
+          \"query\": {
+            \"hybrid\": {
+              \"queries\": [
+                {\"match\": {\"product_title\": \"test\"}},
+                {\"neural\": {\"title_embedding\": {\"query_text\": \"test\", \"model_id\": \"$model_id\", \"k\": 1}}}
+              ]
+            }
+          }
+        }" 2>/dev/null)
+        
+        if echo "$TEST_RESPONSE" | grep -q '"hits"'; then
+            echo -e "${GREEN}✓ Hybrid query is working${NC}"
+        else
+            echo -e "${RED}✗ Hybrid query failed${NC}"
+            echo "Response: $TEST_RESPONSE"
+        fi
     else
-        echo -e "${RED}✗ Hybrid query failed${NC}"
-        echo "Response: $TEST_RESPONSE"
+        echo -e "${YELLOW}⚠ Cannot test hybrid query - index is empty${NC}"
+        echo "  Please ingest data first using -d/--dataset parameter"
     fi
 else
     echo -e "${YELLOW}⚠ Cannot test hybrid query without a deployed model${NC}"
@@ -364,7 +460,7 @@ else
     echo -e "${YELLOW}⚠ Neural-search plugin not verified${NC}"
 fi
 
-if curl -s -o /dev/null -w "%{http_code}" $HOST:$PORT/my-nlp-index-1 2>/dev/null | grep -q 200; then
+if curl -s -o /dev/null -w "%{http_code}" $HOST:$PORT/$INDEX_NAME 2>/dev/null | grep -q 200; then
     echo -e "${GREEN}✓ Index exists${NC}"
 else
     echo -e "${RED}✗ Index missing${NC}"
@@ -378,7 +474,7 @@ else
     READY=false
 fi
 
-DOC_COUNT=$(curl -s $HOST:$PORT/my-nlp-index-1/_count 2>/dev/null | grep -o '"count":[0-9]*' | cut -d: -f2)
+DOC_COUNT=$(curl -s $HOST:$PORT/$INDEX_NAME/_count 2>/dev/null | grep -o '"count":[0-9]*' | cut -d: -f2)
 if [ -n "$DOC_COUNT" ] && [ "$DOC_COUNT" -gt "0" ]; then
     echo -e "${GREEN}✓ Index has data ($DOC_COUNT documents)${NC}"
 else
@@ -388,66 +484,6 @@ fi
 echo ""
 if [ "$READY" = true ] && [ -n "$model_id" ]; then
     echo -e "${GREEN}✅ Prerequisites are met!${NC}"
-    echo ""
-    
-    # Ingest dataset if index is empty and dataset is specified
-    if [ -z "$DOC_COUNT" ] || [ "$DOC_COUNT" -eq "0" ]; then
-        if [ -n "$DATASET_NAME" ]; then
-            # Special handling for esci-product dataset
-            if [ "$DATASET_NAME" = "esci-product" ]; then
-                echo -e "${MAJOR}Ingesting ESCI product dataset...${RESET}"
-                echo "Running: python3 dynamic_hybrid/esci_ingestion.py -m $model_id -h $HOST -p $PORT --full-dataset"
-                
-                python3 dynamic_hybrid/esci_ingestion.py -m "$model_id" -h "$HOST" -p "$PORT" --full-dataset
-                
-                if [ $? -eq 0 ]; then
-                    echo -e "${GREEN}✓ ESCI dataset ingestion completed${NC}"
-                    
-                    # Check document count again
-                    DOC_COUNT=$(curl -s $HOST:$PORT/my-nlp-index-1/_count 2>/dev/null | grep -o '"count":[0-9]*' | cut -d: -f2)
-                    echo "  Document count after ingestion: $DOC_COUNT"
-                else
-                    echo -e "${RED}✗ ESCI dataset ingestion failed${NC}"
-                    echo "Please check the error messages above"
-                    exit 1
-                fi
-            else
-                # Check if dataset URL exists
-                if [ -z "${DATASET_URLS[$DATASET_NAME]}" ]; then
-                    echo -e "${RED}✗ Unknown dataset: $DATASET_NAME${NC}"
-                    echo "Supported datasets: ${!DATASET_URLS[@]} esci-product"
-                    exit 1
-                fi
-                
-                DATASET_URL="${DATASET_URLS[$DATASET_NAME]}"
-                echo -e "${MAJOR}Ingesting $DATASET_NAME dataset...${RESET}"
-                echo "Running: python3 test_opensearch_3.py -d $DATASET_NAME -u $DATASET_URL -h $HOST -p $PORT -i my-nlp-index-1 -o ingest"
-                
-                python3 test_opensearch_3.py \
-                    -d "$DATASET_NAME" \
-                    -u "$DATASET_URL" \
-                    -h $HOST \
-                    -p $PORT \
-                    -i my-nlp-index-1 \
-                    -o ingest
-                
-                if [ $? -eq 0 ]; then
-                    echo -e "${GREEN}✓ Dataset ingestion completed${NC}"
-                    
-                    # Check document count again
-                    DOC_COUNT=$(curl -s $HOST:$PORT/my-nlp-index-1/_count 2>/dev/null | grep -o '"count":[0-9]*' | cut -d: -f2)
-                    echo "  Document count after ingestion: $DOC_COUNT"
-                else
-                    echo -e "${RED}✗ Dataset ingestion failed${NC}"
-                    echo "Please check the error messages above"
-                    exit 1
-                fi
-            fi
-        else
-            echo -e "${YELLOW}⚠ No dataset specified. Use -d/--dataset to ingest data.${NC}"
-        fi
-    fi
-    
     echo ""
     echo "Next steps:"
     echo "1. Run the evaluation from the parent directory:"
