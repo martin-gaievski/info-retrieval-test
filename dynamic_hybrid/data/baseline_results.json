@@ -1,0 +1,16 @@
+{
+  "baseline_dcg": 9.625873415990874,
+  "baseline_ndcg": 0.2553758719739821,
+  "baseline_precision_at_10": 0.26555142503097895,
+  "ratio_of_ratings": 0.3865428492751913,
+  "queries_evaluated": 807,
+  "total_search_results": 6396,
+  "total_ratings": 93909,
+  "ratings_coverage": 0.3481863664790494,
+  "config": {
+    "host": "opense-clust-acggF487TbxL-761fdf3cdba85720.elb.us-east-1.amazonaws.com",
+    "port": 80,
+    "index": "esci-products",
+    "small_version": false
+  }
+}
