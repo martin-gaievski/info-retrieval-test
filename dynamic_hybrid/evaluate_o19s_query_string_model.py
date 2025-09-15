@@ -471,7 +471,7 @@ class O19SQueryStringEvaluator:
                     df_with_ratings = self._merge_results_with_reference(search_results, reference[query_string])
                     
                     if not df_with_ratings.empty:
-                        # Calculate O19S metrics
+                        # Calculate O19S metrics with original ESCI ratings
                         query_metrics = {
                             'dcg': metrics.dcg_at_10(df_with_ratings),
                             'ndcg': metrics.ndcg_at_10(df_with_ratings, reference=reference[query_string]),
@@ -485,12 +485,12 @@ class O19SQueryStringEvaluator:
                 logger.warning(f"O19S query string evaluation failed for query '{query_string}': {e}")
                 continue
         
-        # Average metrics using O19S exact methodology with rounding
+        # Average metrics without rounding for more precision
         if all_metrics:
-            avg_dcg = round(np.mean([m['dcg'] for m in all_metrics]), 2)
-            avg_ndcg = round(np.mean([m['ndcg'] for m in all_metrics]), 2)
-            avg_precision = round(np.mean([m['prec@10'] for m in all_metrics]), 2)
-            avg_ratio = round(np.mean([m['ratio_of_ratings'] for m in all_metrics]), 2)
+            avg_dcg = np.mean([m['dcg'] for m in all_metrics])
+            avg_ndcg = np.mean([m['ndcg'] for m in all_metrics])
+            avg_precision = np.mean([m['prec@10'] for m in all_metrics])
+            avg_ratio = np.mean([m['ratio_of_ratings'] for m in all_metrics])
         else:
             avg_dcg = avg_ndcg = avg_precision = avg_ratio = 0.0
         
@@ -530,7 +530,7 @@ class O19SQueryStringEvaluator:
                     df_with_ratings = self._merge_results_with_reference(search_results, reference[query_string])
                     
                     if not df_with_ratings.empty:
-                        # Calculate O19S metrics
+                        # Calculate O19S metrics with original ESCI ratings
                         query_metrics = {
                             'dcg': metrics.dcg_at_10(df_with_ratings),
                             'ndcg': metrics.ndcg_at_10(df_with_ratings, reference=reference[query_string]),
@@ -605,7 +605,7 @@ class O19SQueryStringEvaluator:
                 "phase_results_processors": [
                     {
                         "normalization-processor": {
-                            "normalization": {"technique": "min_max"},
+                            "normalization": {"technique": "l2"},
                             "combination": {
                                 "technique": "arithmetic_mean",
                                 "parameters": {"weights": [lexical_weight, neural_weight]}

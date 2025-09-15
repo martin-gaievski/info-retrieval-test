@@ -12,7 +12,7 @@ def dcg_at_10(df, k=10, position=None, **kwargs):
         df = df.head(k)
         position = position[:10]
 
-    # Apply DCG formula
+    # Apply DCG formula - revert to exponential gain (original)
     dcg = np.sum(((2.0 ** df['rating']) - 1) / np.log2(position + 2))
     
     return dcg
@@ -62,3 +62,40 @@ def ratio_of_ratings(df, k=10, **kwargs):
         return 0
     else:
         return num_of_ratings/num_of_shown_results
+
+
+def calculate_ndcg_at_k(relevance_scores, k=10):
+    """
+    Calculate NDCG@k for a list of relevance scores.
+    
+    Args:
+        relevance_scores: List of relevance scores in ranking order
+        k: Number of top results to consider
+        
+    Returns:
+        NDCG@k score
+    """
+    if not relevance_scores or k <= 0:
+        return 0.0
+    
+    # Truncate to k items
+    scores = relevance_scores[:k]
+    
+    # Calculate DCG
+    dcg = 0.0
+    for i, score in enumerate(scores):
+        if score > 0:
+            dcg += (2**score - 1) / np.log2(i + 2)
+    
+    # Calculate IDCG (ideal DCG)
+    ideal_scores = sorted(relevance_scores, reverse=True)[:k]
+    idcg = 0.0
+    for i, score in enumerate(ideal_scores):
+        if score > 0:
+            idcg += (2**score - 1) / np.log2(i + 2)
+    
+    # Return NDCG
+    if idcg == 0:
+        return 0.0
+    
+    return dcg / idcg
