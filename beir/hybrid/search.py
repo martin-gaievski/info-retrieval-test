@@ -283,6 +283,36 @@ class RetrievalOpenSearch:
                 }
             }
 
+        def get_body_hybrid_knn(query_text):
+            vector_values=generate_embeddings(query_text)
+            return {
+                'size': result_size,
+                '_source': {
+                    'exclude': [
+                        'passage_embedding'
+                    ]
+                },
+                'query': {
+                    "hybrid": {
+                        "queries": [
+                            {
+                                'match': {
+                                    'query': query_text
+                                }
+                            },
+                            {
+                                'knn': {
+                                    'passage_embedding': {
+                                        'vector': vector_values,
+                                        'k':top_k
+                                    }
+                                }
+                            }
+                        ]
+                    }
+                }
+            }
+
         def get_body_bool(query_text):
             return {
                 'size': result_size,
@@ -355,7 +385,8 @@ class RetrievalOpenSearch:
                 'neural': get_body_neural,
                 'hybrid': get_body_hybrid,
                 'bool': get_body_bool,
-                'msearch': get_body_msearch
+                'msearch': get_body_msearch,
+                'hybrid_knn' : get_body_hybrid_knn
             }
             return searches[self.search_method](query_text)
 
@@ -478,13 +509,14 @@ class RetrievalOpenSearch:
 
         limit = len(query_ids) if query_limit == sys.maxsize else min(len(query_ids), query_limit)
 
-        for i in range(0, 10):
+        for i in range(0, limit):
             q = queries[i]
             query_id = query_ids[i]
 
             search_params = {}
-            if self.search_method == 'hybrid':
+            if self.search_method == 'hybrid' or self.search_method == 'hybrid_knn':
                 search_params["search_pipeline"] = self.pipeline_name
+                query_structure=get_body_vector(get_doc_text(q))
                 query_response = self.opensearch.search(index=index_name,
                                                                     body=get_body_vector(get_doc_text(q)),
                                                                     params=search_params)

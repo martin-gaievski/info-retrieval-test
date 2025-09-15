@@ -102,13 +102,13 @@ def evaluate(corpus, endpoint, index, model_id, port, qrels, queries, qty):
         print('--- end of results for ' + method)'''
 
     # for method in ['neural', 'hybrid']:
-    for method in ['msearch']:
+    for method in ['hybrid_knn']:
         print('starting search method ' + method)
         os_retrival = RetrievalOpenSearch(endpoint, port,
                                           index_name=index,
                                           model_id=model_id,
                                           search_method=method,
-                                          pipeline_name='norm-pipeline')
+                                          pipeline_name='nlp-search-pipeline')
         retriever = EvaluateRetrieval(os_retrival, model_k_values)  # or "cos_sim" for cosine similarity
         top_k = max(model_k_values)
         result_size = max(bm25_k_values)
