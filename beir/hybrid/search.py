@@ -4,6 +4,9 @@ import textwrap
 import random, sys
 from typing import Dict, List
 from opensearchpy import OpenSearch, RequestsHttpConnection
+from opensearch_py_ml.ml_commons import MLCommonClient
+from time import perf_counter
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +42,7 @@ class RetrievalOpenSearch:
             timeout=timeout
         )
         self.pipeline_name = pipeline_name
+        self.ml_client = MLCommonClient(self.opensearch)
 
     """
         Function does bm25 search only
@@ -331,13 +335,111 @@ class RetrievalOpenSearch:
                 }
             }
 
+        def get_body_msearch(query_text):
+            vector_values=generate_embeddings(query_text)
+            query_structure = [
+                {'index': index_name},
+                {'query':{'match':{'passage_text': query_text}},'_source':{'exclude':['passage_embedding']},'size':top_k},
+                {'index': index_name},
+                {'query':{'knn':{'passage_embedding':{'vector': vector_values,'k':top_k}}},'_source':{'exclude':['passage_embedding']},'size':result_size}
+            ]
+            return query_structure
+
+        def generate_embeddings(query_text):
+                input_sentences = [query_text]
+                embeddings= self.ml_client.generate_embedding(self.model_id,input_sentences)
+                return embeddings["inference_results"][0]["output"][0]["data"]
+
         def get_body_vector(query_text):
             searches = {
                 'neural': get_body_neural,
                 'hybrid': get_body_hybrid,
-                'bool': get_body_bool
+                'bool': get_body_bool,
+                'msearch': get_body_msearch
             }
             return searches[self.search_method](query_text)
+
+        def get_time_value(value):
+            if isinstance(value, dict):
+                # If it's a dictionary, extract the time value
+                # Adjust this based on your dictionary structure
+                return float(value.get('took', 0))  # replace 'took' with your actual key
+            elif isinstance(value, str):
+                # If it's a string, convert to float
+                return float(value.replace('s', '').replace('ms', ''))
+            elif isinstance(value, (int, float)):
+                # If it's already a number
+                return float(value)
+            else:
+                return 0.0
+
+        def get_percentiles(self):
+            sorted_times = [get_time_value(value) for value in self.took_time.values()]
+            n = len(sorted_times)
+            print("n is {}",n)
+
+            if n % 2 == 0:
+                p50 = (sorted_times[n//2 - 1] + sorted_times[n//2]) / 2
+            else:
+                p50 = sorted_times[n//2]
+
+            # p90 - 90th percentile
+            p90_index = int(np.ceil(n * 0.90)) - 1
+            print("p90_index is {}",p90_index)
+            p90 = sorted_times[p90_index]
+
+            # p99 - 99th percentile
+            p99_index = int(np.ceil(n * 0.99)) - 1
+            p99 = sorted_times[p99_index]
+
+            # p99.5 - 99.5th percentile
+            p99_5_index = int(np.ceil(n * 0.995)) - 1
+            p99_5 = sorted_times[p99_5_index]
+            print("p99_5_index is {}",p99_5_index)
+
+            p99_9_index = int(np.ceil(n * 0.999)) - 1
+            p99_9 = sorted_times[p99_9_index]
+            print("p99_9_index is {}",p99_9_index)
+
+            # p100 - maximum value
+            p100 = sorted_times[-1]
+
+            return p50, p90, p99, p99_5, p99_9, p100
+
+        def maxNormalize(response,result_size):
+            vectorhits=response.get('responses')[1].get('hits').get('hits')
+            vectorMaxScore=response.get('responses')[1].get('hits').get('max_score')
+            matchhits=response.get('responses')[0].get('hits').get('hits')
+            matchMaxScore=response.get('responses')[0].get('hits').get('max_score')
+
+            scoreMultiplier=1.0
+
+            if vectorMaxScore is not None and vectorMaxScore >0 and matchMaxScore is not None and matchMaxScore >0:
+                scoreMultiplier=matchMaxScore/vectorMaxScore
+
+            finalResponse =[]
+            for i in range(len(vectorhits)):
+                if vectorhits[i].get('_source') is not None:
+                    vectorhits[i]['_score']=vectorhits[i].get('_score')*scoreMultiplier
+                    response.get('responses')[1].get('hits')[i]=vectorhits[i]
+                    finalResponse.append(vectorhits[i])
+
+            for i in range(len(matchhits)):
+                if matchhits[i].get('_source') is not None:
+                    finalResponse.append(matchhits[i])
+
+            sorted_response = sorted(finalResponse, key=lambda x: x['_score'], reverse=True)
+
+            seen = {}
+            for item in sorted_response:
+                _id = item['_id']
+                if _id not in seen:
+                    seen[_id] = item
+                elif item['_score'] > seen[_id]['_score']:
+                    seen[_id] = item
+
+            finalResponse = list(seen.values())[:result_size]
+            return finalResponse
 
         logger.info("Encoding Queries...")
         query_ids = list(queries.keys())
@@ -352,7 +454,6 @@ class RetrievalOpenSearch:
         corpus = [corpus[cid] for cid in corpus_ids]
 
         logger.info("Encoding Corpus in batches... Warning: This might take a while!")
-        # logger.info("Scoring Function: {} ({})".format(self.score_function_desc[score_function], score_function))
 
         model_id = self.model_id
         index_name = self.index_name
@@ -374,55 +475,53 @@ class RetrievalOpenSearch:
             logger.info("Finished warmup queries")
         else:
             logger.info("Skpped warmup queries")
-        
+
         limit = len(query_ids) if query_limit == sys.maxsize else min(len(query_ids), query_limit)
-        '''for i in range(0, limit):
-            q = queries[i]
 
-            search_params = {}
-            if self.search_method == 'hybrid':
-                search_params["search_pipeline"] = self.pipeline_name
-            query_response = self.opensearch.search(index=index_name,
-                                                    body=get_body_vector(get_doc_text(q)),
-                                                    params=search_params)
-            #logger.info(query_response)
-            query_responses.append(query_response)
-            if i % 50 == 0:
-                print("Executed queries: " + str(i))
-
-        ids = [[hit['_id']
-                for hit in query_response['hits']['hits']]
-               for query_response in query_responses]
-
-        for i in range(0, len(query_responses)):
-            query_id = query_ids[i]
-            for hit in query_responses[i]['hits']['hits']:
-                corp_id = hit['_id']
-                if corp_id != query_id:
-                    self.results[query_id][corp_id] = hit['_score']
-            self.took_time[query_id] = int(query_responses[i]['took'])
-
-        return self.results'''
-        for i in range(0, limit):
+        for i in range(0, 10):
             q = queries[i]
             query_id = query_ids[i]
 
             search_params = {}
             if self.search_method == 'hybrid':
                 search_params["search_pipeline"] = self.pipeline_name
-            
-            query_response = self.opensearch.search(index=index_name,
-                                                    body=get_body_vector(get_doc_text(q)),
-                                                    params=search_params)
-            
-            for hit in query_response['hits']['hits']:
-                corp_id = hit['_id']
-                if corp_id != query_id:
-                    self.results[query_id][corp_id] = hit['_score']
-            
-            self.took_time[query_id] = int(query_response['took'])
+                query_response = self.opensearch.search(index=index_name,
+                                                                    body=get_body_vector(get_doc_text(q)),
+                                                                    params=search_params)
+
+                for hit in query_response['hits']['hits']:
+                    corp_id = hit['_id']
+                    if corp_id != query_id:
+                        self.results[query_id][corp_id] = hit['_score']
+
+                self.took_time[query_id] = int(query_response['took'])
+
+            if self.search_method == 'msearch':
+                msearch_query_response = self.opensearch.msearch(index=index_name,body=get_body_vector(get_doc_text(q)))
+
+                start_time = perf_counter()
+                query_response=maxNormalize(msearch_query_response, result_size)
+                end_time = perf_counter()
+                elapsed_time_ms = (end_time - start_time) * 1000
+
+                for hit in query_response:
+                    corp_id = hit['_id']
+                    if corp_id != query_id:
+                        self.results[query_id][corp_id] = hit['_score']
+
+                formatted_time = f"{msearch_query_response.get('took') + elapsed_time_ms:.2f}"
+                self.took_time[query_id] = formatted_time
 
             if i % 50 == 0:
                 print("Executed queries: " + str(i))
+        self.took_time = dict(sorted(self.took_time.items(), key=lambda item: get_time_value(item[1])))
+
+        p50, p90, p99, p99_5, p99_9, p100 = get_percentiles(self)
+        print(f"p50: {p50}")     # 5.5
+        print(f"p90: {p90}")     # 9
+        print(f"p99: {p99}")     # 10
+        print(f"p99.5: {p99_5}") # 10
+        print(f"p99.9: {p99_9}") # 10
+        print(f"p100: {p100}")   # 10
 
         return self.results

@@ -102,7 +102,7 @@ def evaluate(corpus, endpoint, index, model_id, port, qrels, queries, qty):
         print('--- end of results for ' + method)'''
 
     # for method in ['neural', 'hybrid']:
-    for method in ['hybrid']:
+    for method in ['msearch']:
         print('starting search method ' + method)
         os_retrival = RetrievalOpenSearch(endpoint, port,
                                           index_name=index,
@@ -112,58 +112,10 @@ def evaluate(corpus, endpoint, index, model_id, port, qrels, queries, qty):
         retriever = EvaluateRetrieval(os_retrival, model_k_values)  # or "cos_sim" for cosine similarity
         top_k = max(model_k_values)
         result_size = max(bm25_k_values)
-        # results = retriever.retrieve(corpus, queries)
         results = os_retrival.search_vector(corpus, queries, top_k=top_k, result_size=result_size, query_limit=qty, skip_warmups=True)
-
-        # Get the raw search results
-        # raw_results = os_retrival.search_vector(corpus, queries, top_k=top_k, result_size=result_size)
-
-        # Convert tuple results to the expected dictionary format
-        '''formatted_results = {}
-        # Process each query individually
-        for query_id, query_text in queries.items():
-            raw_results = os_retrival.search_vector(corpus, {query_id: query_text}, top_k=top_k, result_size=result_size)
-
-            # Initialize the query results
-            formatted_results[query_id] = {}
-
-            # Ensure we have results for this query
-            if raw_results and len(raw_results) >= 2:
-                doc_ids = raw_results[0]
-                scores = raw_results[1]
-                print(str(doc_ids) + str(scores))
-
-                # Create dictionary of doc_id -> score for this query
-                for doc_id, score in zip(doc_ids, scores):
-                    if isinstance(doc_id, str) and isinstance(score, (int, float)):
-                        formatted_results[query_id][doc_id] = float(score)
-
-            else:
-                print("Query return no results")
-
-        print(f"Results quantity:" + str(len(formatted_results)))
-        print(f"Results format: {type(formatted_results)}")
-        print(f"Sample result structure: {list(formatted_results.items())[:1]}")
-
-        ndcg, _map, recall, precision = retriever.evaluate(qrels, formatted_results, k_values)
-        '''
 
         ndcg, _map, recall, precision = retriever.evaluate(qrels, results, k_values)
         print('--- end of results for ' + method)
-
-    # method = 'hybrid'
-    # print('starting search method ' + method)
-    # os_retrival = RetrievalOpenSearch(endpoint, port,
-    # index_name=index,
-    # model_id=model_id,
-    # search_method=method,
-    # pipeline_name='norm-pipeline')
-    # retriever = EvaluateRetrieval(os_retrival, bm25_k_values, model_k_values)  # or "cos_sim" for cosine similarity
-    # results = retriever.retrieve(corpus, queries)
-    # results = retriever.search(corpus, queries, top_k)
-    # ndcg, _map, recall, precision = retriever.evaluate(qrels, results, k_values)
-    # print('--- end of results for ' + method)
-
 
 if __name__ == "__main__":
     main(sys.argv[1:])
