@@ -430,9 +430,34 @@ class O19SCorpusAwareEvaluator:
             raise FileNotFoundError(f"Model not found: {model_path}")
             
         with open(model_path, 'rb') as f:
-            self.model = pickle.load(f)
+            loaded_data = pickle.load(f)
             
-        logger.info(f"Loaded O19S corpus-aware model from {model_path}")
+        # Handle both new dictionary format and old direct model format
+        if isinstance(loaded_data, dict):
+            # New format with model, scaler, and normalization_stats
+            self.model = loaded_data['model']
+            self.scaler = loaded_data.get('scaler', None)
+            self.normalization_stats = loaded_data.get('normalization_stats', None)
+            logger.info(f"Loaded O19S corpus-aware model from {model_path} (new format with scaler)")
+            if self.normalization_stats:
+                logger.info("Normalization statistics available - model trained with all 6 combinations")
+                # Log which combinations were selected most often during training
+                total_selections = sum(sum(comb.values()) for comb in self.normalization_stats.values())
+                if total_selections > 0:
+                    logger.info("Training combination selection statistics:")
+                    for norm in self.normalization_stats:
+                        for comb in self.normalization_stats[norm]:
+                            count = self.normalization_stats[norm][comb]
+                            percentage = (count / total_selections * 100) if total_selections > 0 else 0
+                            if count > 0:
+                                logger.info(f"  {norm}/{comb}: {count} times ({percentage:.1f}%)")
+        else:
+            # Old format - just the model directly
+            self.model = loaded_data
+            self.scaler = None
+            self.normalization_stats = None
+            logger.info(f"Loaded O19S corpus-aware model from {model_path} (legacy format)")
+            
         logger.info(f"Model type: {type(self.model)}")
         logger.info(f"Expected features: {self.model.n_features_in_}")
         
@@ -511,6 +536,10 @@ class O19SCorpusAwareEvaluator:
             ]
             
             feature_df = pd.DataFrame([feature_vector], columns=feature_names)
+            
+            # Apply scaler if available (from new training format)
+            if hasattr(self, 'scaler') and self.scaler is not None:
+                feature_df = pd.DataFrame(self.scaler.transform(feature_df), columns=feature_names)
             
             # Predict NDCG for this weight
             predicted_ndcg = self.model.predict(feature_df)[0]

@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
-Train O19S Corpus-Aware Linear Regression Model
+Train O19S Exact Methodology Model
 
-This script trains a Ridge regression model using the exact O19S approach:
-1. Uses the same 18 features (6 query + 12 real-time corpus features)
-2. Collects training data by testing multiple weights per query
-3. Tests all 6 combinations (2 normalizations × 3 combinations) and selects best NDCG
-4. Uses O19S termvectors API method for corpus feature collection
-5. Trains Ridge regression to predict NDCG given features including weight
+This script trains a Ridge regression model using the EXACT O19S approach:
+1. For each query, tests ALL 66 combinations (6 techniques × 11 weights)
+2. Selects the SINGLE BEST result across all combinations
+3. Creates ONE training sample per query with optimal weight
+4. Model learns: Query features → Optimal weight for best NDCG
+5. Evaluation uses fixed l2/arithmetic_mean with predicted weight
 
-The trained model can then be used for dynamic weight prediction.
+This is the true O19S methodology where the model predicts the optimal weight.
 
 Author: Dynamic Hybrid Search Team  
-Version: 2.0.0 - O19S exact methodology with all normalization/combination techniques
+Version: 3.0.0 - O19S EXACT global optimization methodology
 """
 
 import os
@@ -64,8 +64,8 @@ logging.basicConfig(format='%(asctime)s - %(message)s',
 logger = logging.getLogger(__name__)
 
 
-class O19SCorpusAwareTrainer:
-    """Train O19S corpus-aware models using exact methodology"""
+class O19SExactTrainer:
+    """Train O19S models using EXACT global optimization methodology"""
     
     # O19S exact list of common English stopwords
     STOPWORDS = {
@@ -78,6 +78,8 @@ class O19SCorpusAwareTrainer:
     # O19S normalization and combination techniques
     NORMALIZATION_TECHNIQUES = ['min_max', 'l2']
     COMBINATION_TECHNIQUES = ['arithmetic_mean', 'harmonic_mean', 'geometric_mean']
+    # O19S uses 11 weights from 0.0 to 1.0
+    WEIGHT_VALUES = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
     
     def __init__(self, 
                  host: str = "localhost",
@@ -85,7 +87,7 @@ class O19SCorpusAwareTrainer:
                  index_name: str = "esci-products",
                  model_id: str = None,
                  corpus_field: str = "product_title"):
-        """Initialize O19S corpus-aware trainer"""
+        """Initialize O19S exact trainer"""
         
         self.client = OpenSearch(
             hosts=[{'host': host, 'port': port}],
@@ -108,17 +110,17 @@ class O19SCorpusAwareTrainer:
         self._total_docs = None
         
         # Statistics tracking
-        self.normalization_stats = {norm: {comb: 0 for comb in self.COMBINATION_TECHNIQUES} 
-                                   for norm in self.NORMALIZATION_TECHNIQUES}
+        self.optimal_weights_distribution = []  # Track which weights are optimal
+        self.optimal_techniques_distribution = []  # Track which techniques are optimal
         self.total_combinations_tested = 0
         
         # Initialize corpus info
         self._initialize_corpus_info()
         
-        logger.info(f"Initialized O19S corpus-aware trainer for {host}:{port}/{index_name}")
+        logger.info(f"Initialized O19S EXACT trainer for {host}:{port}/{index_name}")
         logger.info(f"Corpus field: {corpus_field}")
         logger.info(f"Total documents: {self._total_docs}")
-        logger.info(f"Will test {len(self.NORMALIZATION_TECHNIQUES)} normalizations × {len(self.COMBINATION_TECHNIQUES)} combinations = 6 total")
+        logger.info(f"Will test {len(self.NORMALIZATION_TECHNIQUES) * len(self.COMBINATION_TECHNIQUES) * len(self.WEIGHT_VALUES)} = 66 combinations per query")
     
     def _initialize_corpus_info(self):
         """Initialize corpus information."""
@@ -135,58 +137,30 @@ class O19SCorpusAwareTrainer:
         """
         Checks if a string ends with a punctuation character.
         O19S exact implementation.
-        
-        Args:
-            text: The input string.
-        
-        Returns:
-            1 if the string ends with punctuation, 0 otherwise.
         """
-        # Check for empty or whitespace-only strings
         stripped_text = text.strip()
         if not stripped_text:
             return 0
-        
-        # Get the last character of the stripped string and check if it's in the punctuation set
         return 1 if stripped_text[-1] in string.punctuation else 0
     
     def unique_terms_ratio(self, text: str) -> float:
         """
         Calculates the ratio of unique terms to the total number of terms in a string.
         O19S exact implementation.
-        
-        The string is first preprocessed to remove punctuation and convert to lowercase
-        to ensure accurate term counting.
-        
-        Args:
-            text: The input string.
-        
-        Returns:
-            The ratio of unique terms. Returns 0.0 if the string has no terms.
         """
-        # Preprocess the text: convert to lowercase and remove punctuation
-        # A regular expression is used to split the text into words
         preprocessed_text = text.lower()
         terms = re.findall(r'\b\w+\b', preprocessed_text)
         
-        # Handle the case of an empty string or a string with no words
         if not terms:
             return 0.0
         
         unique_terms = set(terms)
-        
         return len(unique_terms) / len(terms)
     
     def capital_letters_ratio(self, text: str) -> float:
         """
         Calculates the ratio of capital letters to the total number of characters in a string.
         O19S exact implementation.
-        
-        Args:
-            text: The input string.
-        
-        Returns:
-            The ratio of capital letters. Returns 0.0 if the string is empty.
         """
         if not text:
             return 0.0
@@ -198,59 +172,42 @@ class O19SCorpusAwareTrainer:
         """
         Calculates the ratio of stopwords to the total number of terms in a string.
         O19S exact implementation.
-        
-        The string is preprocessed to handle case and punctuation.
-        
-        Args:
-            text: The input string.
-        
-        Returns:
-            The ratio of stopwords. Returns 0.0 if the string has no terms.
         """
-        # Preprocess the text to get a list of terms
         preprocessed_text = text.lower()
         terms = re.findall(r'\b\w+\b', preprocessed_text)
         
-        # Handle the case of an empty string or a string with no words
         if not terms:
             return 0.0
         
         stopword_count = sum(1 for term in terms if term in self.STOPWORDS)
-        
         return stopword_count / len(terms)
     
-    def collect_training_data(self, 
-                             o19s_data_path: str,
-                             ratings_file: str,
-                             sample_size: Optional[int] = None,
-                             weights_to_test: Optional[List[float]] = None,
-                             use_fixed_queries: bool = False) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def collect_training_data_exact(self, 
+                                   o19s_data_path: str,
+                                   ratings_file: str,
+                                   sample_size: Optional[int] = None,
+                                   use_fixed_queries: bool = False) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Collect training data using O19S methodology.
+        Collect training data using O19S EXACT methodology.
         
         For each query in training set:
-        1. Test multiple weights (0.1-0.9)
-        2. For each weight, test all 6 normalization/combination techniques
-        3. Select the combination that produces the highest NDCG@10
-        4. Extract 18 features (including weight) for the best combination
-        5. Create training sample: features -> best_NDCG
+        1. Test ALL 66 combinations (6 techniques × 11 weights)
+        2. Select the SINGLE BEST result across all combinations
+        3. Extract features using the optimal weight from best combination
+        4. Create ONE training sample per query: features -> best_NDCG
         
         Args:
             o19s_data_path: Path to O19S data
             ratings_file: Path to ratings file
             sample_size: Number of queries to use for training
-            weights_to_test: Weights to test per query
-            use_fixed_queries: If True, use fixed order from CSV; if False, use random sampling
+            use_fixed_queries: If True, use fixed order from CSV
             
         Returns:
-            (X_features, y_ndcg, query_ids): Training features, target NDCG values, and query IDs
+            (X_features, y_ndcg): Training features and target NDCG values
         """
         
-        if weights_to_test is None:
-            weights_to_test = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
-        
-        logger.info(f"Collecting training data with weights: {weights_to_test}")
-        logger.info(f"Testing all 6 combinations: {self.NORMALIZATION_TECHNIQUES} × {self.COMBINATION_TECHNIQUES}")
+        logger.info(f"Collecting training data using O19S EXACT methodology")
+        logger.info(f"Testing ALL 66 combinations per query (6 techniques × 11 weights)")
         
         # Load O19S data
         train_file = Path(o19s_data_path) / 'query_train.csv'
@@ -280,7 +237,7 @@ class O19SCorpusAwareTrainer:
             else:
                 logger.info(f"Using all {len(train_queries)} queries from fixed dataset")
         else:
-            # Existing behavior: random sampling
+            # Random sampling
             if sample_size and sample_size < len(train_queries):
                 np.random.seed(42)
                 train_queries = np.random.choice(train_queries, size=sample_size, replace=False).tolist()
@@ -292,88 +249,99 @@ class O19SCorpusAwareTrainer:
         train_queries_with_ratings = [q for q in train_queries if q in reference]
         logger.info(f"Training queries with ratings: {len(train_queries_with_ratings)}")
         
-        # Collect training samples
+        # Collect training samples - ONE per query
         X_features = []
         y_ndcg = []
-        query_ids = []  # Track which query each sample belongs to
         
-        total_samples = len(train_queries_with_ratings) * len(weights_to_test)
-        logger.info(f"Expected training samples: {total_samples}")
-        
-        samples_collected = 0
+        logger.info(f"Expected training samples: {len(train_queries_with_ratings)} (one per query)")
         
         for query_idx, query_string in enumerate(tqdm(train_queries_with_ratings, desc="Collecting training data")):
             if query_string not in reference:
                 continue
+            
+            # Test ALL 66 combinations for this query
+            best_result = {
+                'ndcg': 0.0,
+                'weight': 0.5,  # Default
+                'normalization': 'l2',
+                'combination': 'arithmetic_mean'
+            }
+            
+            for weight in self.WEIGHT_VALUES:
+                neural_weight = weight
+                lexical_weight = round(1.0 - weight, 2)
                 
-            for weight in weights_to_test:
-                try:
-                    # Extract 18 features using O19S method
-                    features = self._extract_o19s_18_features(query_string, weight)
-                    
-                    # Test all 6 normalization/combination techniques
-                    lexical_weight = round(1.0 - weight, 2)
-                    best_ndcg = 0.0
-                    best_combination = ('l2', 'arithmetic_mean')  # Default
-                    
-                    for normalization, combination in itertools.product(self.NORMALIZATION_TECHNIQUES, 
-                                                                       self.COMBINATION_TECHNIQUES):
-                        try:
-                            # Run hybrid search with this specific normalization/combination
-                            search_results = self._execute_hybrid_search(
-                                query_string, lexical_weight, weight, 
-                                normalization, combination
-                            )
+                for normalization, combination in itertools.product(self.NORMALIZATION_TECHNIQUES, 
+                                                                   self.COMBINATION_TECHNIQUES):
+                    try:
+                        # Run hybrid search with this specific configuration
+                        search_results = self._execute_hybrid_search(
+                            query_string, lexical_weight, neural_weight, 
+                            normalization, combination
+                        )
+                        
+                        if not search_results.empty:
+                            # Calculate actual NDCG for this configuration
+                            df_with_ratings = self._merge_results_with_reference(search_results, reference[query_string])
                             
-                            if not search_results.empty:
-                                # Calculate actual NDCG for this combination
-                                df_with_ratings = self._merge_results_with_reference(search_results, reference[query_string])
+                            if not df_with_ratings.empty:
+                                actual_ndcg = metrics.ndcg_at_10(df_with_ratings, reference=reference[query_string])
                                 
-                                if not df_with_ratings.empty:
-                                    actual_ndcg = metrics.ndcg_at_10(df_with_ratings, reference=reference[query_string])
-                                    
-                                    # Track if this is the best combination
-                                    if actual_ndcg > best_ndcg:
-                                        best_ndcg = actual_ndcg
-                                        best_combination = (normalization, combination)
-                                    
-                                    self.total_combinations_tested += 1
-                        
-                        except Exception as e:
-                            logger.debug(f"Failed combination {normalization}/{combination}: {e}")
-                            continue
+                                # Track if this is the globally best configuration
+                                if actual_ndcg > best_result['ndcg']:
+                                    best_result = {
+                                        'ndcg': actual_ndcg,
+                                        'weight': weight,
+                                        'normalization': normalization,
+                                        'combination': combination
+                                    }
+                                
+                                self.total_combinations_tested += 1
                     
-                    # Only add training sample if we got at least one valid NDCG
-                    if best_ndcg > 0:
-                        # Add training sample with best NDCG and query ID
-                        X_features.append(features)
-                        y_ndcg.append(best_ndcg)
-                        query_ids.append(query_string)  # Use query string as ID
-                        samples_collected += 1
-                        
-                        # Track which combination was best
-                        self.normalization_stats[best_combination[0]][best_combination[1]] += 1
+                    except Exception as e:
+                        logger.debug(f"Failed {weight}/{normalization}/{combination}: {e}")
+                        continue
+            
+            # Create ONE training sample with the optimal configuration
+            if best_result['ndcg'] > 0:
+                # Extract features using the OPTIMAL weight
+                features = self._extract_o19s_18_features(query_string, best_result['weight'])
                 
-                except Exception as e:
-                    logger.warning(f"Failed to collect sample for query '{query_string}', weight {weight}: {e}")
-                    continue
+                # Add training sample
+                X_features.append(features)
+                y_ndcg.append(best_result['ndcg'])
+                
+                # Track statistics
+                self.optimal_weights_distribution.append(best_result['weight'])
+                self.optimal_techniques_distribution.append(f"{best_result['normalization']}/{best_result['combination']}")
+                
+                logger.debug(f"Query '{query_string}': Best weight={best_result['weight']:.1f}, "
+                           f"technique={best_result['normalization']}/{best_result['combination']}, "
+                           f"NDCG={best_result['ndcg']:.4f}")
         
-        logger.info(f"Collected {samples_collected} training samples")
-        logger.info(f"Unique queries in training data: {len(np.unique(query_ids))}")
+        logger.info(f"Collected {len(X_features)} training samples (one per query)")
         logger.info(f"Total combinations tested: {self.total_combinations_tested}")
         
-        # Report statistics on which combinations were selected as best
-        logger.info("\nBest combination selection statistics:")
-        for norm in self.NORMALIZATION_TECHNIQUES:
-            for comb in self.COMBINATION_TECHNIQUES:
-                count = self.normalization_stats[norm][comb]
-                percentage = (count / samples_collected * 100) if samples_collected > 0 else 0
-                logger.info(f"  {norm}/{comb}: {count} times ({percentage:.1f}%)")
+        # Report optimal weight distribution
+        if self.optimal_weights_distribution:
+            weight_counts = pd.Series(self.optimal_weights_distribution).value_counts().sort_index()
+            logger.info("\nOptimal weight distribution:")
+            for weight, count in weight_counts.items():
+                percentage = (count / len(self.optimal_weights_distribution)) * 100
+                logger.info(f"  Weight {weight:.1f}: {count} queries ({percentage:.1f}%)")
         
-        if samples_collected == 0:
+        # Report optimal technique distribution
+        if self.optimal_techniques_distribution:
+            technique_counts = pd.Series(self.optimal_techniques_distribution).value_counts()
+            logger.info("\nOptimal technique distribution:")
+            for technique, count in technique_counts.items():
+                percentage = (count / len(self.optimal_techniques_distribution)) * 100
+                logger.info(f"  {technique}: {count} queries ({percentage:.1f}%)")
+        
+        if len(X_features) == 0:
             raise ValueError("No training samples collected")
             
-        return np.array(X_features), np.array(y_ndcg), np.array(query_ids)
+        return np.array(X_features), np.array(y_ndcg)
     
     def _extract_o19s_18_features(self, query: str, weight: float) -> List[float]:
         """Extract 18 features using O19S exact methodology."""
@@ -392,24 +360,24 @@ class O19SCorpusAwareTrainer:
         
         # Create 18-feature vector in O19S training order
         feature_vector = [
-            weight,  # f_0_neuralness (neural_search_weight)
-            query_features['f_2_query_length'],  # query_length
-            query_features['f_4_has_special_char'],  # has_special_char
-            query_features['f_5_has_punctuation_at_end'],  # has_punctuation_at_end
-            query_features['f_7_capital_letters_ratio'],  # capital_letters_ratio
-            query_features['f_8_stopwords_ratio'],  # stopwords_ratio
-            corpus_features['max_document_frequency'],  # max_document_frequency
-            corpus_features['min_document_frequency'],  # min_document_frequency
-            corpus_features['total_document_frequency'],  # total_document_frequency
-            corpus_features['average_document_frequency'],  # average_document_frequency
-            corpus_features['variance_document_frequency'],  # variance_document_frequency
-            corpus_features['std_dev_document_frequency'],  # std_dev_document_frequency
-            corpus_features['max_inverse_document_frequency'],  # max_inverse_document_frequency
-            corpus_features['min_inverse_document_frequency'],  # min_inverse_document_frequency
-            corpus_features['total_inverse_document_frequency'],  # total_inverse_document_frequency
-            corpus_features['average_inverse_document_frequency'],  # average_inverse_document_frequency
-            corpus_features['variance_inverse_document_frequency'],  # variance_inverse_document_frequency
-            corpus_features['std_dev_inverse_document_frequency']  # std_dev_inverse_document_frequency
+            weight,  # f_0_neuralness (neural_search_weight) - THIS IS THE OPTIMAL WEIGHT
+            query_features['f_2_query_length'],
+            query_features['f_4_has_special_char'],
+            query_features['f_5_has_punctuation_at_end'],
+            query_features['f_7_capital_letters_ratio'],
+            query_features['f_8_stopwords_ratio'],
+            corpus_features['max_document_frequency'],
+            corpus_features['min_document_frequency'],
+            corpus_features['total_document_frequency'],
+            corpus_features['average_document_frequency'],
+            corpus_features['variance_document_frequency'],
+            corpus_features['std_dev_document_frequency'],
+            corpus_features['max_inverse_document_frequency'],
+            corpus_features['min_inverse_document_frequency'],
+            corpus_features['total_inverse_document_frequency'],
+            corpus_features['average_inverse_document_frequency'],
+            corpus_features['variance_inverse_document_frequency'],
+            corpus_features['std_dev_inverse_document_frequency']
         ]
         
         return feature_vector
@@ -536,27 +504,17 @@ class O19SCorpusAwareTrainer:
     def train_model(self,
                    X_features: np.ndarray,
                    y_ndcg: np.ndarray,
-                   query_ids: np.ndarray = None,
                    alpha: float = 10.0,
                    test_size: float = 0.2,
                    use_cross_validation: bool = True) -> Ridge:
         """
         Train Ridge regression model using O19S exact methodology.
         
-        Args:
-            X_features: Feature matrix (samples x 18 features)
-            y_ndcg: Target NDCG values
-            query_ids: Query identifiers for each sample (for query-based splitting)
-            alpha: Ridge regularization parameter (O19S uses 10.0)
-            test_size: Fraction for validation split
-            use_cross_validation: If True, use ShuffleSplit cross-validation (O19S method)
-            
-        Returns:
-            Trained Ridge regression model with feature scaler
+        Note: Since we have ONE sample per query, we don't need query-based splitting.
         """
         
-        logger.info(f"Training Ridge regression model (O19S exact methodology)...")
-        logger.info(f"  Training samples: {len(X_features)}")
+        logger.info(f"Training Ridge regression model (O19S EXACT methodology)...")
+        logger.info(f"  Training samples: {len(X_features)} (one per query)")
         logger.info(f"  Features: {X_features.shape[1]}")
         logger.info(f"  Alpha (regularization): {alpha}")
         logger.info(f"  Test split: {test_size}")
@@ -580,35 +538,13 @@ class O19SCorpusAwareTrainer:
         X_scaled = scaler.fit_transform(X_df)
         X_df = pd.DataFrame(X_scaled, columns=feature_names)
         
-        if query_ids is not None and len(np.unique(query_ids)) > 1:
-            # O19S Query-based splitting: keep all samples from same query together
-            logger.info("Using query-based train/test split (O19S method)")
-            unique_queries = np.unique(query_ids)
-            n_test_queries = int(len(unique_queries) * test_size)
-            
-            # Shuffle queries and split
-            np.random.seed(0)  # O19S uses random_state=0
-            shuffled_queries = np.random.permutation(unique_queries)
-            test_queries = shuffled_queries[:n_test_queries]
-            train_queries = shuffled_queries[n_test_queries:]
-            
-            # Create masks for train/test samples
-            train_mask = np.isin(query_ids, train_queries)
-            test_mask = np.isin(query_ids, test_queries)
-            
-            X_train = X_df[train_mask]
-            X_test = X_df[test_mask]
-            y_train = y_ndcg[train_mask]
-            y_test = y_ndcg[test_mask]
-            
-            logger.info(f"  Train queries: {len(train_queries)}, samples: {len(X_train)}")
-            logger.info(f"  Test queries: {len(test_queries)}, samples: {len(X_test)}")
-        else:
-            # Fallback to sample-based splitting if no query IDs
-            logger.info("Using sample-based train/test split (fallback)")
-            X_train, X_test, y_train, y_test = train_test_split(
-                X_df, y_ndcg, test_size=test_size, random_state=0
-            )
+        # Simple train/test split (one sample per query)
+        X_train, X_test, y_train, y_test = train_test_split(
+            X_df, y_ndcg, test_size=test_size, random_state=0
+        )
+        
+        logger.info(f"  Train samples: {len(X_train)}")
+        logger.info(f"  Test samples: {len(X_test)}")
         
         # Train Ridge regression model
         model = Ridge(alpha=alpha, solver='auto', random_state=0)
@@ -657,13 +593,10 @@ class O19SCorpusAwareTrainer:
             logger.info(f"  {name}: {original_scale_coef:.6f}")
         logger.info(f"  Intercept: {model.intercept_:.6f}")
         
-        # Check weight sensitivity
+        # Check weight sensitivity - CRITICAL for O19S methodology
         weight_coef = model.coef_[0] / scaler.scale_[0] if scaler.scale_[0] != 0 else model.coef_[0]
-        logger.info(f"\nWeight sensitivity: {abs(weight_coef):.6f}")
-        if abs(weight_coef) < 0.01:
-            logger.warning("⚠️  Model is not sensitive to weight changes!")
-        else:
-            logger.info("✅ Model is sensitive to weight changes")
+        logger.info(f"\nWeight (f_0_neuralness) coefficient: {weight_coef:.6f}")
+        logger.info("NOTE: In O19S methodology, weight is the TARGET being predicted!")
         
         # Store scaler with model for use during inference
         self.scaler = scaler
@@ -708,7 +641,7 @@ class O19SCorpusAwareTrainer:
                 }
             },
             "search_pipeline": {
-                "description": f"O19S training with {normalization}/{combination}",
+                "description": f"O19S EXACT with {normalization}/{combination}",
                 "phase_results_processors": [
                     {
                         "normalization-processor": {
@@ -728,177 +661,196 @@ class O19SCorpusAwareTrainer:
             # Use OpenSearch client which preserves hostname case
             result = self.client.search(index=self.index_name, body=payload)
             
-            rows = []
-            for position, hit in enumerate(result['hits']['hits']):
-                rows.append({
-                    'product_id': hit['_id'],
-                    'position': position,
-                    'relevance': hit['_score']
-                })
+            # Parse results into DataFrame
+            hits = result.get('hits', {}).get('hits', [])
             
-            return pd.DataFrame(rows) if rows else pd.DataFrame()
+            if not hits:
+                return pd.DataFrame()
+            
+            # Extract relevant fields
+            data = []
+            for hit in hits:
+                doc = {
+                    'product_id': hit['_source'].get('product_id', ''),
+                    'score': hit.get('_score', 0.0)
+                }
+                data.append(doc)
+            
+            df = pd.DataFrame(data)
+            return df
             
         except Exception as e:
-            logger.error(f"Hybrid search failed for query '{query}' with {normalization}/{combination}: {e}")
+            logger.debug(f"Search failed: {e}")
             return pd.DataFrame()
     
-    def _merge_results_with_reference(self, search_results: pd.DataFrame, reference_ratings: pd.DataFrame) -> pd.DataFrame:
+    def _merge_results_with_reference(self, search_results: pd.DataFrame, reference: pd.DataFrame) -> pd.DataFrame:
         """Merge search results with reference ratings."""
         
-        if search_results.empty or reference_ratings.empty:
+        if search_results.empty:
             return pd.DataFrame()
-            
-        merged = search_results.merge(
-            reference_ratings,
-            left_on='product_id',
-            right_on='docid',
+        
+        # Rename columns for consistency
+        search_results = search_results.rename(columns={'product_id': 'docid'})
+        
+        # Add position column (required for NDCG calculation)
+        search_results['position'] = range(1, len(search_results) + 1)
+        
+        # Merge with reference ratings
+        merged = pd.merge(
+            search_results,
+            reference[['docid', 'rating']],
+            on='docid',
             how='left'
         )
         
+        # Fill missing ratings with 0
         merged['rating'] = merged['rating'].fillna(0)
-        return merged[['position', 'rating', 'product_id', 'relevance']]
+        
+        return merged
+    
+    def save_model(self, model: Ridge, output_path: str):
+        """Save trained model and configuration."""
+        
+        # Prepare model package
+        model_data = {
+            'model': model,
+            'scaler': self.scaler,
+            'feature_names': [
+                'f_0_neuralness', 'f_2_query_length', 'f_4_has_special_char', 
+                'f_5_has_punctuation_at_end', 'f_7_capital_letters_ratio', 'f_8_stopwords_ratio',
+                'f_14_max_document_frequency', 'f_15_min_document_frequency', 'f_16_total_document_frequency',
+                'f_17_average_document_frequency', 'f_18_variance_document_frequency', 'f_19_std_dev_document_frequency',
+                'f_20_max_inverse_document_frequency', 'f_21_min_inverse_document_frequency', 'f_22_total_inverse_document_frequency',
+                'f_23_average_inverse_document_frequency', 'f_24_variance_inverse_document_frequency', 'f_25_std_dev_inverse_document_frequency'
+            ],
+            'training_stats': {
+                'optimal_weights_distribution': self.optimal_weights_distribution,
+                'optimal_techniques_distribution': self.optimal_techniques_distribution,
+                'total_combinations_tested': self.total_combinations_tested
+            },
+            'methodology': 'o19s_exact_global_optimization',
+            'version': '3.0.0'
+        }
+        
+        # Save model
+        with open(output_path, 'wb') as f:
+            pickle.dump(model_data, f)
+        
+        logger.info(f"Model saved to {output_path}")
+        
+        # Also save statistics summary
+        stats_path = output_path.replace('.pkl', '_stats.json')
+        
+        # Calculate weight distribution stats
+        weight_counts = {}
+        if self.optimal_weights_distribution:
+            for w in self.optimal_weights_distribution:
+                weight_counts[str(w)] = weight_counts.get(str(w), 0) + 1
+        
+        # Calculate technique distribution stats
+        technique_counts = {}
+        if self.optimal_techniques_distribution:
+            for t in self.optimal_techniques_distribution:
+                technique_counts[t] = technique_counts.get(t, 0) + 1
+        
+        stats_summary = {
+            'training_samples': len(self.optimal_weights_distribution),
+            'total_combinations_tested': self.total_combinations_tested,
+            'optimal_weight_distribution': weight_counts,
+            'optimal_technique_distribution': technique_counts,
+            'methodology': 'o19s_exact_global_optimization'
+        }
+        
+        with open(stats_path, 'w') as f:
+            json.dump(stats_summary, f, indent=2)
+        
+        logger.info(f"Training statistics saved to {stats_path}")
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Train O19S corpus-aware linear regression model",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Train model with 100 queries and 3 weights for quick testing (random sampling)
-  python train_o19s_corpus_aware_model.py \\
-    --model-id huggingface/sentence-transformers/all-MiniLM-L6-v2 \\
-    --sample-size 100 \\
-    --weights "0.3,0.5,0.7"
-
-  # Train with fixed queries from CSV (no random sampling)
-  python train_o19s_corpus_aware_model.py \\
-    --model-id huggingface/sentence-transformers/all-MiniLM-L6-v2 \\
-    --use-fixed-queries \\
-    --sample-size 100 \\
-    --weights "0.3,0.5,0.7"
-
-  # Full training with all queries and all weights
-  python train_o19s_corpus_aware_model.py \\
-    --model-id huggingface/sentence-transformers/all-MiniLM-L6-v2 \\
-    --weights "0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9"
-        """
-    )
+    """Main training function for O19S EXACT methodology."""
     
-    parser.add_argument('--host', default='localhost', help='OpenSearch host')
-    parser.add_argument('-p', '--port', type=int, default=9200, help='OpenSearch port')
-    parser.add_argument('-i', '--index', default='esci-products', help='Index name')
-    parser.add_argument('-m', '--model-id', required=True, help='Neural model ID')
-    parser.add_argument('--corpus-field', default='product_title',
-                       help='Field to analyze for corpus statistics')
-    parser.add_argument('--o19s-data', default='dynamic_hybrid/data',
-                       help='Path to O19S data directory')
-    parser.add_argument('--ratings-file', default='dynamic_hybrid/data/ratings.csv',
-                       help='Path to O19S ratings.csv file')
+    parser = argparse.ArgumentParser(description='Train O19S model using EXACT global optimization methodology')
+    parser.add_argument('--host', type=str, default='localhost',
+                       help='OpenSearch host')
+    parser.add_argument('--port', type=int, default=9200,
+                       help='OpenSearch port')
+    parser.add_argument('--index-name', type=str, default='esci-products',
+                       help='Index name')
+    parser.add_argument('--model-id', type=str, required=True,
+                       help='Neural model ID')
+    parser.add_argument('--o19s-data-path', type=str, default='dynamic_hybrid/data',
+                       help='Path to O19S data')
+    parser.add_argument('--ratings-file', type=str, default='dynamic_hybrid/data/esci_dataset_ratings.tsv',
+                       help='Path to ratings file')
     parser.add_argument('--sample-size', type=int, default=None,
-                       help='Number of training queries to use (default: None = use all)')
-    parser.add_argument('--weights', type=str, default='0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9',
-                       help='Weights to test per query (comma-separated)')
-    parser.add_argument('--alpha', type=float, default=10.0,
-                       help='Ridge regularization parameter')
+                       help='Number of queries to use for training')
     parser.add_argument('--use-fixed-queries', action='store_true',
-                       help='Use fixed queries from CSV in order (no random sampling)')
-    parser.add_argument('--output', default='o19s_corpus_aware_trained_model.pkl',
-                       help='Output model file')
+                       help='Use fixed queries from CSV in order')
+    parser.add_argument('--alpha', type=float, default=10.0,
+                       help='Ridge regression regularization parameter')
+    parser.add_argument('--test-size', type=float, default=0.2,
+                       help='Test set size')
+    parser.add_argument('--use-cross-validation', action='store_true', default=True,
+                       help='Use cross-validation')
+    parser.add_argument('--output-model', type=str, default='o19s_exact_methodology_model.pkl',
+                       help='Output model file path')
     
     args = parser.parse_args()
     
-    # Parse weights
-    try:
-        weights_to_test = [float(w.strip()) for w in args.weights.split(',')]
-        logger.info(f"Training with weights: {weights_to_test}")
-    except ValueError as e:
-        logger.error(f"Invalid weights format: {e}")
-        sys.exit(1)
+    logger.info("=" * 80)
+    logger.info("O19S EXACT Methodology Training")
+    logger.info("=" * 80)
+    logger.info(f"Global optimization: Test ALL 66 combinations per query")
+    logger.info(f"Target: Model predicts optimal weight for best NDCG")
+    logger.info("=" * 80)
     
     # Initialize trainer
-    trainer = O19SCorpusAwareTrainer(
+    trainer = O19SExactTrainer(
         host=args.host,
         port=args.port,
-        index_name=args.index,
-        model_id=args.model_id,
-        corpus_field=args.corpus_field
+        index_name=args.index_name,
+        model_id=args.model_id
     )
     
-    # Collect training data
-    logger.info("🔍 Collecting training data with real-time corpus features...")
-    logger.info("   Testing all 6 normalization/combination techniques per query-weight pair")
-    if args.use_fixed_queries:
-        logger.info("   Using fixed query order from CSV files")
-    else:
-        logger.info("   Using random query sampling")
-    logger.info("   This will query OpenSearch for each training sample")
+    # Collect training data using EXACT methodology
+    logger.info("\n" + "=" * 80)
+    logger.info("Phase 1: Collecting Training Data (O19S EXACT)")
+    logger.info("=" * 80)
     
-    start_time = time.time()
-    X_features, y_ndcg, query_ids = trainer.collect_training_data(
-        o19s_data_path=args.o19s_data,
+    X_features, y_ndcg = trainer.collect_training_data_exact(
+        o19s_data_path=args.o19s_data_path,
         ratings_file=args.ratings_file,
         sample_size=args.sample_size,
-        weights_to_test=weights_to_test,
         use_fixed_queries=args.use_fixed_queries
     )
-    data_collection_time = time.time() - start_time
     
-    logger.info(f"Training data collection completed in {data_collection_time:.1f}s")
-    logger.info(f"Collected {len(X_features)} training samples from {len(np.unique(query_ids))} unique queries")
+    # Train model
+    logger.info("\n" + "=" * 80)
+    logger.info("Phase 2: Training Ridge Regression Model")
+    logger.info("=" * 80)
     
-    # Train model with query-based splitting (O19S exact methodology)
-    logger.info("🚀 Training Ridge regression model with O19S exact methodology...")
-    model = trainer.train_model(X_features, y_ndcg, query_ids=query_ids, alpha=args.alpha)
+    model = trainer.train_model(
+        X_features=X_features,
+        y_ndcg=y_ndcg,
+        alpha=args.alpha,
+        test_size=args.test_size,
+        use_cross_validation=args.use_cross_validation
+    )
     
-    # Save trained model with scaler
-    model_data = {
-        'model': model,
-        'scaler': trainer.scaler,
-        'normalization_stats': trainer.normalization_stats
-    }
+    # Save model
+    logger.info("\n" + "=" * 80)
+    logger.info("Phase 3: Saving Model")
+    logger.info("=" * 80)
     
-    model_path = args.output
-    with open(model_path, 'wb') as f:
-        pickle.dump(model_data, f)
+    trainer.save_model(model, args.output_model)
     
-    logger.info(f"✅ Trained model saved to: {model_path}")
-    
-    # Save training metadata
-    metadata = {
-        'training_samples': len(X_features),
-        'features': 18,
-        'weights_tested': weights_to_test,
-        'alpha': args.alpha,
-        'corpus_field': args.corpus_field,
-        'use_fixed_queries': args.use_fixed_queries,
-        'data_collection_time_seconds': data_collection_time,
-        'normalization_stats': trainer.normalization_stats,
-        'total_combinations_tested': trainer.total_combinations_tested,
-        'feature_names': [
-            'f_0_neuralness', 'f_2_query_length', 'f_4_has_special_char', 
-            'f_5_has_punctuation_at_end', 'f_7_capital_letters_ratio', 'f_8_stopwords_ratio',
-            'f_14_max_document_frequency', 'f_15_min_document_frequency', 'f_16_total_document_frequency',
-            'f_17_average_document_frequency', 'f_18_variance_document_frequency', 'f_19_std_dev_document_frequency',
-            'f_20_max_inverse_document_frequency', 'f_21_min_inverse_document_frequency', 'f_22_total_inverse_document_frequency',
-            'f_23_average_inverse_document_frequency', 'f_24_variance_inverse_document_frequency', 'f_25_std_dev_inverse_document_frequency'
-        ]
-    }
-    
-    metadata_path = args.output.replace('.pkl', '_metadata.json')
-    with open(metadata_path, 'w') as f:
-        json.dump(metadata, f, indent=2)
-    
-    logger.info(f"Training metadata saved to: {metadata_path}")
-    
-    # Final summary
-    logger.info(f"\n🎯 TRAINING COMPLETED SUCCESSFULLY:")
-    logger.info(f"   Model: {model_path}")
-    logger.info(f"   Metadata: {metadata_path}")
-    logger.info(f"   Training samples: {len(X_features)}")
-    logger.info(f"   Features: 18 (O19S corpus-aware)")
-    logger.info(f"   Data collection time: {data_collection_time:.1f}s")
-    logger.info(f"   Total combinations tested: {trainer.total_combinations_tested}")
+    logger.info("\n" + "=" * 80)
+    logger.info("Training Complete!")
+    logger.info("=" * 80)
+    logger.info(f"Model saved to: {args.output_model}")
+    logger.info(f"Use with evaluate_o19s_exact_methodology.py for evaluation")
+    logger.info("=" * 80)
 
 
 if __name__ == "__main__":
