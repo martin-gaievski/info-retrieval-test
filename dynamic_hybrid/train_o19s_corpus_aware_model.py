@@ -225,7 +225,7 @@ class O19SCorpusAwareTrainer:
         """
         
         if weights_to_test is None:
-            weights_to_test = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+            weights_to_test = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
         
         logger.info(f"Collecting training data with weights: {weights_to_test}")
         
@@ -552,9 +552,6 @@ class O19SCorpusAwareTrainer:
     def _execute_hybrid_search(self, query: str, lexical_weight: float, neural_weight: float) -> pd.DataFrame:
         """Execute hybrid search for training data collection."""
         
-        url = f"http://{self.host}:{self.port}/{self.index_name}/_search"
-        headers = {'Content-Type': 'application/json'}
-        
         payload = {
             "_source": {"excludes": ["title_embedding"]},
             "query": {
@@ -605,9 +602,8 @@ class O19SCorpusAwareTrainer:
         }
         
         try:
-            response = requests.post(url, headers=headers, data=json.dumps(payload), timeout=30)
-            response.raise_for_status()
-            result = response.json()
+            # Use OpenSearch client which preserves hostname case
+            result = self.client.search(index=self.index_name, body=payload)
             
             rows = []
             for position, hit in enumerate(result['hits']['hits']):

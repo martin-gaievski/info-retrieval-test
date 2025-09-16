@@ -31,6 +31,10 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, current_dir)
 sys.path.insert(0, os.path.join(current_dir, '..'))
 
+# Import required modules for feature extraction
+import string
+import re
+
 # O19S imports
 from dynamic_hybrid.utils import metrics
 from opensearchpy import OpenSearch
@@ -48,6 +52,14 @@ logger = logging.getLogger(__name__)
 
 class O19SCorpusAwareFeatureExtractor:
     """Extract O19S corpus-aware features with real-time OpenSearch queries."""
+    
+    # O19S exact list of common English stopwords (must match training script)
+    STOPWORDS = {
+        "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "if", "in",
+        "into", "is", "it", "no", "not", "of", "on", "or", "such", "that", "the",
+        "their", "then", "there", "these", "they", "this", "to", "was", "will",
+        "with", "without"
+    }
     
     def __init__(self, 
                  opensearch_client: OpenSearch,
@@ -89,19 +101,19 @@ class O19SCorpusAwareFeatureExtractor:
     
     def extract_features(self, query: str, weight: float) -> Dict[str, float]:
         """Extract corpus-aware features for O19S 18-feature model."""
-        words = query.split()
         
-        # Extract query features (5 features)
+        # Extract query features using exact O19S methods from training script
         query_features = {
             'f_2_query_length': len(query),
             'f_4_has_special_char': float(any(c in query for c in '!@#$%^&*()_+-=[]{}|;:,.<>?')),
-            'f_5_has_punctuation_at_end': float(query.endswith(('.', '!', '?', ';', ':')) if query else False),
-            'f_7_capital_letters_ratio': sum(1 for c in query if c.isupper()) / len(query) if query else 0,
-            'f_8_stopwords_ratio': self._calculate_stopwords_ratio(words)
+            'f_5_has_punctuation_at_end': float(self.has_punctuation_at_end(query)),
+            'f_7_capital_letters_ratio': self.capital_letters_ratio(query),
+            'f_8_stopwords_ratio': self.stopwords_ratio(query)
         }
         
         # Extract real-time corpus features (12 features)
-        corpus_features = self._collect_realtime_corpus_features(words)
+        # For corpus features, we use the full query string not split words
+        corpus_features = self._collect_realtime_corpus_features([query])
         
         # Combine all features including weight
         all_features = {
@@ -111,6 +123,73 @@ class O19SCorpusAwareFeatureExtractor:
         }
         
         return all_features
+    
+    # O19S Exact Query Feature Functions (must match training script exactly)
+    
+    def has_punctuation_at_end(self, text: str) -> int:
+        """
+        Checks if a string ends with a punctuation character.
+        O19S exact implementation from training script.
+        
+        Args:
+            text: The input string.
+        
+        Returns:
+            1 if the string ends with punctuation, 0 otherwise.
+        """
+        import string
+        
+        # Check for empty or whitespace-only strings
+        stripped_text = text.strip()
+        if not stripped_text:
+            return 0
+        
+        # Get the last character of the stripped string and check if it's in the punctuation set
+        return 1 if stripped_text[-1] in string.punctuation else 0
+    
+    def capital_letters_ratio(self, text: str) -> float:
+        """
+        Calculates the ratio of capital letters to the total number of characters in a string.
+        O19S exact implementation from training script.
+        
+        Args:
+            text: The input string.
+        
+        Returns:
+            The ratio of capital letters. Returns 0.0 if the string is empty.
+        """
+        if not text:
+            return 0.0
+        
+        capital_count = sum(1 for char in text if char.isupper())
+        return capital_count / len(text)
+    
+    def stopwords_ratio(self, text: str) -> float:
+        """
+        Calculates the ratio of stopwords to the total number of terms in a string.
+        O19S exact implementation from training script.
+        
+        The string is preprocessed to handle case and punctuation.
+        
+        Args:
+            text: The input string.
+        
+        Returns:
+            The ratio of stopwords. Returns 0.0 if the string has no terms.
+        """
+        import re
+        
+        # Preprocess the text to get a list of terms
+        preprocessed_text = text.lower()
+        terms = re.findall(r'\b\w+\b', preprocessed_text)
+        
+        # Handle the case of an empty string or a string with no words
+        if not terms:
+            return 0.0
+        
+        stopword_count = sum(1 for term in terms if term in self.STOPWORDS)
+        
+        return stopword_count / len(terms)
     
     def _collect_realtime_corpus_features(self, query_terms: List[str]) -> Dict[str, float]:
         """
@@ -276,18 +355,6 @@ class O19SCorpusAwareFeatureExtractor:
 
         return statistics
     
-    def _calculate_stopwords_ratio(self, words: List[str]) -> float:
-        """Calculate ratio of stopwords in query."""
-        stopwords = {
-            'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by',
-            'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did',
-            'will', 'would', 'could', 'should', 'may', 'might', 'can', 'this', 'that', 'these', 'those'
-        }
-        
-        if not words:
-            return 0.0
-        stopword_count = sum(1 for w in words if w.lower() in stopwords)
-        return stopword_count / len(words)
     
     def _get_zero_corpus_features(self) -> Dict[str, float]:
         """Return zero values for all corpus features when no terms available."""
@@ -401,7 +468,7 @@ class O19SCorpusAwareEvaluator:
     def predict_best_weight(self, query: str, weights_to_test: List[float] = None) -> Tuple[float, float, Dict[str, float]]:
         """Predict best weight using O19S methodology with real-time corpus features."""
         if weights_to_test is None:
-            weights_to_test = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+            weights_to_test = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
         
         all_predictions = {}
         best_weight = 0.5
@@ -448,6 +515,7 @@ class O19SCorpusAwareEvaluator:
             # Predict NDCG for this weight
             predicted_ndcg = self.model.predict(feature_df)[0]
             all_predictions[weight] = predicted_ndcg
+            # print(f"Predicted NDCG for weight {weight}: {predicted_ndcg}")
             
             # Track best weight
             if predicted_ndcg > best_predicted_ndcg:
