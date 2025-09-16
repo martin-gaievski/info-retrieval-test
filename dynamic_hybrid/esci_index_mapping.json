@@ -21,6 +21,7 @@
       "product_title": {
         "type": "text",
         "analyzer": "esci_analyzer",
+        "term_vector": "with_positions_offsets_payloads",
         "fields": {
           "keyword": {
             "type": "keyword",
