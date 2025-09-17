@@ -596,7 +596,8 @@ class O19SExactTrainer:
         # Check weight sensitivity - CRITICAL for O19S methodology
         weight_coef = model.coef_[0] / scaler.scale_[0] if scaler.scale_[0] != 0 else model.coef_[0]
         logger.info(f"\nWeight (f_0_neuralness) coefficient: {weight_coef:.6f}")
-        logger.info("NOTE: In O19S methodology, weight is the TARGET being predicted!")
+        logger.info("NOTE: Weight is an INPUT feature. Model predicts NDCG scores!")
+        logger.info("Negative coefficient suggests lower weights produce higher NDCG.")
         
         # Store scaler with model for use during inference
         self.scaler = scaler

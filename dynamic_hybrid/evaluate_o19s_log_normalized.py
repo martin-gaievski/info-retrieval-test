@@ -30,9 +30,8 @@ import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from dynamic_hybrid.feature_extractor_corpus_aware import ESCICorpusAwareFeatureExtractor
-from dynamic_hybrid.utils.metrics import calculate_ndcg_at_k, ndcg_at_10
-from dynamic_hybrid.load_o19s_ratings import load_ratings_data as load_ratings_csv
+from dynamic_hybrid.feature_extractor_o19s_exact import O19SExactFeatureExtractor
+from dynamic_hybrid.utils import metrics
 
 
 class O19SLogNormalizedEvaluator:
@@ -80,11 +79,10 @@ class O19SLogNormalizedEvaluator:
         self.model_id = model_id
         self.index_name = "esci-products"
         
-        # Initialize feature extractor with O19S feature set
-        self.feature_extractor = ESCICorpusAwareFeatureExtractor(
+        # Initialize feature extractor with O19S exact methodology
+        self.feature_extractor = O19SExactFeatureExtractor(
             client=self.client,
-            index_name=self.index_name,
-            feature_set='o19s'
+            index_name=self.index_name
         )
         
     def extract_and_normalize_features(self, query: str, weight: float) -> np.ndarray:
@@ -98,10 +96,11 @@ class O19SLogNormalizedEvaluator:
         Returns:
             Normalized feature vector
         """
-        # Extract features (returns dict)
+        # Extract features using O19S exact methodology (returns dict)
         features_dict = self.feature_extractor.extract_features(query)
         
-        # Convert to list in expected order
+        # Convert to list in O19S exact order from feature_extractor.get_feature_names()
+        # The order matches what O19SExactFeatureExtractor returns
         features = [
             features_dict.get('query_length', 0),
             features_dict.get('has_special_chars', 0),
@@ -122,7 +121,7 @@ class O19SLogNormalizedEvaluator:
             features_dict.get('std_dev_inverse_document_frequency', 0)
         ]
         
-        # Add weight as first feature
+        # Add weight as first feature (18 features total: weight + 17 O19S features)
         features_with_weight = [weight] + features
         features_array = np.array(features_with_weight)
         
@@ -240,7 +239,7 @@ class O19SLogNormalizedEvaluator:
                 "phase_results_processors": [
                     {
                         "normalization-processor": {
-                            "normalization": {"technique": "min_max"},
+                            "normalization": {"technique": "l2"},
                             "combination": {
                                 "technique": "arithmetic_mean",
                                 "parameters": {"weights": [lexical_weight, neural_weight]}
@@ -259,13 +258,15 @@ class O19SLogNormalizedEvaluator:
             print(f"Hybrid search failed for query '{query}': {e}")
             return []
     
-    def evaluate_queries(self, queries_df: pd.DataFrame, sample_size: int = None) -> Dict:
+    def evaluate_queries(self, queries_df: pd.DataFrame, sample_size: int = None, 
+                        evaluate_static_weights: bool = True) -> Dict:
         """
-        Evaluate model on a set of queries
+        Evaluate model on a set of queries using O19S corpus-aware methodology
         
         Args:
             queries_df: DataFrame with queries and ratings
             sample_size: Number of queries to evaluate
+            evaluate_static_weights: Whether to evaluate static weight baselines (default: True)
             
         Returns:
             Evaluation results dictionary
@@ -273,14 +274,14 @@ class O19SLogNormalizedEvaluator:
         if sample_size:
             queries_df = queries_df.head(sample_size)
         
-        results = {
-            'static_0.0': [],
-            'static_0.3': [],
-            'static_0.5': [],
-            'static_0.7': [],
-            'static_1.0': [],
-            'dynamic': []
-        }
+        results = {}
+        
+        # Initialize results dictionary based on what we're evaluating
+        if evaluate_static_weights:
+            for weight in [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]:
+                results[f'static_{weight}'] = []
+        
+        results['dynamic'] = []
         
         weight_predictions = []
         prediction_scores = []
@@ -295,16 +296,42 @@ class O19SLogNormalizedEvaluator:
             if not relevance_dict:
                 continue
             
-            # Static weight evaluations
-            for weight in [0.0, 0.3, 0.5, 0.7, 1.0]:
-                search_results = self.hybrid_search(query, weight)
-                # Calculate NDCG using product IDs and ratings
-                relevance_scores = []
-                for product_id in search_results[:10]:
-                    relevance_scores.append(relevance_dict.get(product_id, 0))
-                
-                ndcg = calculate_ndcg_at_k(relevance_scores, k=10) if relevance_scores else 0.0
-                results[f'static_{weight}'].append(ndcg)
+            # Create reference DataFrame for NDCG calculation (matching corpus_aware approach)
+            reference_df = pd.DataFrame([
+                {'docid': doc_id, 'rating': rating}
+                for doc_id, rating in relevance_dict.items()
+            ])
+            
+            # Static weight evaluations (optional)
+            if evaluate_static_weights:
+                for weight in [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]:
+                    search_results = self.hybrid_search(query, weight, size=100)  # Get more results
+                    
+                    # Create search results DataFrame
+                    if search_results:
+                        search_df = pd.DataFrame([
+                            {'product_id': doc_id, 'position': pos, 'relevance': 1.0}
+                            for pos, doc_id in enumerate(search_results[:10])
+                        ])
+                        
+                        # Merge with ratings
+                        merged_df = search_df.merge(
+                            reference_df,
+                            left_on='product_id',
+                            right_on='docid',
+                            how='left'
+                        )
+                        merged_df['rating'] = merged_df['rating'].fillna(0)
+                        
+                        # Calculate NDCG using the same method as corpus_aware
+                        if not merged_df.empty:
+                            ndcg = metrics.ndcg_at_10(merged_df, reference=reference_df)
+                        else:
+                            ndcg = 0.0
+                    else:
+                        ndcg = 0.0
+                        
+                    results[f'static_{weight}'].append(ndcg)
             
             # Dynamic weight prediction
             optimal_weight, predicted_score = self.predict_optimal_weight(query)
@@ -312,13 +339,31 @@ class O19SLogNormalizedEvaluator:
             prediction_scores.append(predicted_score)
             
             # Evaluate with predicted weight
-            search_results = self.hybrid_search(query, optimal_weight)
-            # Calculate NDCG using product IDs and ratings
-            relevance_scores = []
-            for product_id in search_results[:10]:
-                relevance_scores.append(relevance_dict.get(product_id, 0))
+            search_results = self.hybrid_search(query, optimal_weight, size=100)
             
-            ndcg = calculate_ndcg_at_k(relevance_scores, k=10) if relevance_scores else 0.0
+            if search_results:
+                search_df = pd.DataFrame([
+                    {'product_id': doc_id, 'position': pos, 'relevance': 1.0}
+                    for pos, doc_id in enumerate(search_results[:10])
+                ])
+                
+                # Merge with ratings
+                merged_df = search_df.merge(
+                    reference_df,
+                    left_on='product_id',
+                    right_on='docid',
+                    how='left'
+                )
+                merged_df['rating'] = merged_df['rating'].fillna(0)
+                
+                # Calculate NDCG
+                if not merged_df.empty:
+                    ndcg = metrics.ndcg_at_10(merged_df, reference=reference_df)
+                else:
+                    ndcg = 0.0
+            else:
+                ndcg = 0.0
+                
             results['dynamic'].append(ndcg)
             
             if (idx + 1) % 10 == 0:
@@ -345,11 +390,56 @@ class O19SLogNormalizedEvaluator:
             'unique_weights': unique_weights,
             'is_collapsed': is_collapsed,
             'mean_predicted_score': np.mean(prediction_scores),
-            'num_queries': len(queries_df)
+            'num_queries': len(queries_df),
+            'static_weights_evaluated': evaluate_static_weights
         }
 
 
-# Use the imported load_ratings_csv function instead
+def load_test_queries(query_file: str = "dynamic_hybrid/data/query_test.csv",
+                     ratings_file: str = "dynamic_hybrid/data/ratings.csv",
+                     sample_size: Optional[int] = None) -> pd.DataFrame:
+    """
+    Load test queries from query_test.csv with ratings.
+    
+    Args:
+        query_file: Path to query_test.csv (FIXED to use test file)
+        ratings_file: Path to ratings.csv
+        sample_size: Number of queries to use (None for all)
+        
+    Returns:
+        DataFrame with queries and ratings
+    """
+    print(f"\n📂 Loading TEST data from {query_file}")
+    
+    # Load test queries
+    queries_df = pd.read_csv(query_file)
+    print(f"  Loaded {len(queries_df)} test queries")
+    
+    # Load ratings - FIXED: Handle tab-delimited file with no headers
+    ratings_df = pd.read_csv(ratings_file, sep='\t', header=None, 
+                           names=['query_string', 'product_id', 'esci_label', 'query_id'],
+                           on_bad_lines='skip')
+    print(f"  Loaded {len(ratings_df)} rating entries")
+    
+    # FIXED: Group ratings by query_string (not query_id) to match training
+    ratings_grouped = ratings_df.groupby('query_string').apply(
+        lambda x: dict(zip(x['product_id'], x['esci_label']))
+    ).to_dict()
+    
+    # FIXED: Map ratings using query_string instead of query_id
+    queries_df['ratings'] = queries_df['query_string'].map(ratings_grouped)
+    queries_df['query'] = queries_df['query_string']  # Map column name
+    
+    # Filter queries with ratings
+    queries_with_ratings = queries_df[queries_df['ratings'].notna()]
+    print(f"  Test queries with ratings: {len(queries_with_ratings)}")
+    
+    # Apply sample size if specified
+    if sample_size:
+        queries_with_ratings = queries_with_ratings.head(sample_size)
+        print(f"  Using sample size: {sample_size}")
+    
+    return queries_with_ratings
 
 
 def main():
@@ -368,6 +458,10 @@ def main():
                        help='Path to ratings CSV file')
     parser.add_argument('--sample-size', type=int, default=100,
                        help='Number of queries to evaluate')
+    parser.add_argument('--evaluate-static-weights', action='store_true', default=True,
+                       help='Evaluate static weight baselines (default: True)')
+    parser.add_argument('--skip-static-weights', action='store_true',
+                       help='Skip static weight evaluations to reduce running time')
     parser.add_argument('--output', type=str, default='o19s_log_normalized_evaluation.json',
                        help='Output file for results')
     
@@ -376,10 +470,12 @@ def main():
     print("O19S Log-Normalized Model Evaluation")
     print("=" * 50)
     
-    # Load data
-    print(f"\nLoading ratings from {args.ratings_path}...")
-    queries_df = load_ratings_csv(args.ratings_path, args.sample_size)
-    print(f"Loaded {len(queries_df)} queries")
+    # FIXED: Load TEST queries from query_test.csv
+    queries_df = load_test_queries(
+        query_file="dynamic_hybrid/data/query_test.csv",
+        ratings_file=args.ratings_path,
+        sample_size=args.sample_size
+    )
     
     # Initialize evaluator
     print(f"\nLoading model from {args.model_file}...")
@@ -391,8 +487,16 @@ def main():
         port=args.port
     )
     
+    # Determine whether to evaluate static weights
+    evaluate_static = args.evaluate_static_weights and not args.skip_static_weights
+    
     # Run evaluation
-    results = evaluator.evaluate_queries(queries_df, args.sample_size)
+    print(f"\nEvaluation mode:")
+    print(f"  Dynamic weight prediction: Yes")
+    print(f"  Static weight baselines: {'Yes (11 weights)' if evaluate_static else 'No (skipped for speed)'}")
+    
+    results = evaluator.evaluate_queries(queries_df, args.sample_size, 
+                                        evaluate_static_weights=evaluate_static)
     
     # Display results
     print("\n" + "=" * 50)
@@ -415,13 +519,26 @@ def main():
     
     # Performance comparison
     dynamic_ndcg = results['ndcg_scores']['dynamic']
-    best_static = max(v for k, v in results['ndcg_scores'].items() if k.startswith('static'))
-    improvement = ((dynamic_ndcg - best_static) / best_static) * 100 if best_static > 0 else 0
     
-    print(f"\nPerformance Summary:")
-    print(f"  Dynamic NDCG: {dynamic_ndcg:.4f}")
-    print(f"  Best Static: {best_static:.4f}")
-    print(f"  Improvement: {improvement:+.1f}%")
+    if results.get('static_weights_evaluated', True):
+        static_scores = [v for k, v in results['ndcg_scores'].items() if k.startswith('static')]
+        if static_scores:
+            best_static = max(static_scores)
+            best_static_weight = [k for k, v in results['ndcg_scores'].items() 
+                                 if k.startswith('static') and v == best_static][0]
+            improvement = ((dynamic_ndcg - best_static) / best_static) * 100 if best_static > 0 else 0
+            
+            print(f"\nPerformance Summary:")
+            print(f"  Dynamic NDCG: {dynamic_ndcg:.4f}")
+            print(f"  Best Static ({best_static_weight}): {best_static:.4f}")
+            print(f"  Improvement: {improvement:+.1f}%")
+        else:
+            print(f"\nPerformance Summary:")
+            print(f"  Dynamic NDCG: {dynamic_ndcg:.4f}")
+    else:
+        print(f"\nPerformance Summary:")
+        print(f"  Dynamic NDCG: {dynamic_ndcg:.4f}")
+        print(f"  Static weights: Not evaluated (--skip-static-weights used)")
     
     # Save results
     with open(args.output, 'w') as f:

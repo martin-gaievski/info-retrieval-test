@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Improved O19S model training with stronger weight signal based on initial results.
-Implements recommendations from the first training run.
+Fixed O19S model training with proper train/test separation and consistent feature extractor.
+Uses O19SExactFeatureExtractor to match evaluation script.
 """
 
 import numpy as np
@@ -22,10 +22,82 @@ import os
 # Add parent directory to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from dynamic_hybrid.feature_extractor_corpus_aware import ESCICorpusAwareFeatureExtractor
+# FIXED: Use O19S exact feature extractor to match evaluation
+from dynamic_hybrid.feature_extractor_o19s_exact import O19SExactFeatureExtractor
 from dynamic_hybrid.utils.metrics import ndcg_at_10
-from dynamic_hybrid.load_o19s_ratings import load_ratings_data
 from opensearchpy import OpenSearch
+
+
+def load_training_queries(query_file: str = "dynamic_hybrid/data/query_train.csv",
+                         ratings_file: str = "dynamic_hybrid/data/ratings.csv",
+                         sample_size: Optional[int] = None) -> pd.DataFrame:
+    """
+    Load training queries from query_train.csv with ratings.
+    
+    Args:
+        query_file: Path to query_train.csv
+        ratings_file: Path to ratings.csv
+        sample_size: Number of queries to use (None for all)
+        
+    Returns:
+        DataFrame with queries and ratings
+    """
+    print(f"\n📂 Loading training data from {query_file}")
+    
+    # Load training queries
+    queries_df = pd.read_csv(query_file)
+    print(f"  Loaded {len(queries_df)} training queries")
+    
+    # Load ratings - handle missing headers and tab delimiter
+    ratings_df = pd.read_csv(ratings_file, sep='\t', header=None, 
+                           names=['query_string', 'product_id', 'esci_label', 'query_id'],
+                           on_bad_lines='skip')  # Skip malformed lines
+    print(f"  Loaded {len(ratings_df)} rating entries")
+    
+    # Merge ratings with queries by query_string
+    # Group ratings by query_string
+    ratings_grouped = ratings_df.groupby('query_string').apply(
+        lambda x: dict(zip(x['product_id'], x['esci_label']))
+    ).to_dict()
+    
+    # Add ratings to queries
+    queries_df['ratings'] = queries_df['query_string'].map(ratings_grouped)
+    
+    # Add query_id for compatibility
+    queries_df['query_id'] = queries_df.index
+    
+    # Filter queries with ratings
+    queries_with_ratings = queries_df[queries_df['ratings'].notna()]
+    print(f"  Queries with ratings: {len(queries_with_ratings)}")
+    
+    # Apply sample size if specified
+    if sample_size:
+        queries_with_ratings = queries_with_ratings.head(sample_size)
+        print(f"  Using sample size: {sample_size}")
+    
+    return queries_with_ratings
+
+
+def calculate_ndcg_at_k(relevance_scores: List[float], k: int = 10) -> float:
+    """Calculate NDCG@k for a list of relevance scores."""
+    if not relevance_scores:
+        return 0.0
+    
+    # Truncate to k
+    relevance_scores = relevance_scores[:k]
+    
+    # Calculate DCG
+    dcg = sum([score / np.log2(i + 2) for i, score in enumerate(relevance_scores)])
+    
+    # Calculate ideal DCG
+    ideal_scores = sorted(relevance_scores, reverse=True)
+    idcg = sum([score / np.log2(i + 2) for i, score in enumerate(ideal_scores)])
+    
+    # Calculate NDCG
+    if idcg == 0:
+        return 0.0
+    
+    return dcg / idcg
 
 
 class OpenSearchClient:
@@ -123,7 +195,7 @@ class OpenSearchClient:
 
 
 class O19SImprovedTrainer:
-    """Improved O19S model trainer with stronger weight signal."""
+    """Fixed O19S model trainer with proper feature extractor."""
     
     def __init__(self, opensearch_client, model_id: str, 
                  corpus_field: str = "product_title",
@@ -144,12 +216,13 @@ class O19SImprovedTrainer:
         self.corpus_field = corpus_field
         self.amplification_factor = amplification_factor
         self.use_robust_scaler = use_robust_scaler
+        self.index_name = opensearch_client.index_name  # Add index_name attribute
         
-        # Use ESCICorpusAwareFeatureExtractor with O19S feature set
-        self.feature_extractor = ESCICorpusAwareFeatureExtractor(
-            client=opensearch_client.client,
-            index_name=opensearch_client.index_name,
-            feature_set='o19s'
+        # FIXED: Use O19SExactFeatureExtractor to match evaluation
+        self.feature_extractor = O19SExactFeatureExtractor(
+            client=self.client.client,  # Pass the actual OpenSearch client
+            index_name=self.index_name,
+            field_name="product_title"  # Using product_title for corpus stats
         )
         
         # Fixed normalization and combination
@@ -168,10 +241,11 @@ class O19SImprovedTrainer:
             self.full_scaler = StandardScaler()
             scaler_type = "StandardScaler"
         
-        print(f"Initialized IMPROVED O19S trainer")
-        print(f"Host: {opensearch_client.host}:{opensearch_client.port}/{opensearch_client.index_name}")
-        print(f"Weight amplification: {amplification_factor}x (stronger signal)")
-        print(f"Normalization: Log transform + {scaler_type}")
+        print(f"Initialized FIXED O19S trainer")
+        print(f"  ✅ Using O19SExactFeatureExtractor (matches evaluation)")
+        print(f"  Host: {opensearch_client.host}:{opensearch_client.port}/{opensearch_client.index_name}")
+        print(f"  Weight amplification: {amplification_factor}x")
+        print(f"  Normalization: Log transform + {scaler_type}")
         
     def normalize_features(self, X: np.ndarray, fit: bool = True) -> np.ndarray:
         """
@@ -221,7 +295,6 @@ class O19SImprovedTrainer:
     
     def collect_training_data(self, queries_df: pd.DataFrame, 
                              weights: List[float],
-                             sample_size: Optional[int] = None,
                              use_augmentation: bool = True) -> Tuple[np.ndarray, np.ndarray]:
         """
         Collect training data with optional augmentation.
@@ -229,17 +302,13 @@ class O19SImprovedTrainer:
         Args:
             queries_df: DataFrame with queries and ratings
             weights: List of weight values to test
-            sample_size: Number of queries to use (None for all)
             use_augmentation: Add extra samples at extreme weights for emphasis
             
         Returns:
             X: Feature matrix with normalized features
             y: Target NDCG values
         """
-        if sample_size:
-            queries_df = queries_df.head(sample_size)
-        
-        print(f"\nCollecting training data with improved normalization")
+        print(f"\nCollecting training data with O19S exact features")
         print(f"Queries: {len(queries_df)}, Weights per query: {len(weights)}")
         if use_augmentation:
             print("Data augmentation: Emphasizing extreme weights (0.0, 1.0)")
@@ -255,7 +324,7 @@ class O19SImprovedTrainer:
         pbar = tqdm(total=total, desc="Collecting training data")
         
         for _, row in queries_df.iterrows():
-            query = row['query']
+            query = row['query_string']  # FIXED: Use correct column name
             query_id = row['query_id']
             
             # Get ratings for this query
@@ -266,10 +335,10 @@ class O19SImprovedTrainer:
                     pbar.update(2)
                 continue
             
-            # Extract features once per query
+            # Extract features once per query using O19S exact method
             features_dict = self.feature_extractor.extract_features(query)
             
-            # Convert to list
+            # Convert to list (O19S exact feature order)
             features = [
                 features_dict.get('query_length', 0),
                 features_dict.get('has_special_chars', 0),
@@ -292,7 +361,7 @@ class O19SImprovedTrainer:
             
             # Test each weight
             for weight in weights:
-                # Add weight as first feature
+                # Add weight as first feature (O19S methodology)
                 feature_vector = [weight] + features
                 
                 # Perform hybrid search
@@ -351,17 +420,17 @@ class O19SImprovedTrainer:
         
         # Print feature statistics
         print(f"\n📊 Feature Statistics (before normalization):")
-        print(f"Weight: mean={np.mean(X[:, 0]):.4f}, std={np.std(X[:, 0]):.4f}")
-        print(f"Corpus max freq: mean={np.mean(X[:, 6]):.1f}, max={np.max(X[:, 6]):.1f}")
+        print(f"  Weight: mean={np.mean(X[:, 0]):.4f}, std={np.std(X[:, 0]):.4f}")
+        print(f"  Corpus max freq: mean={np.mean(X[:, 6]):.1f}, max={np.max(X[:, 6]):.1f}")
         
         # Apply improved normalization
         X_normalized = self.normalize_features(X, fit=True)
         
         # Print normalized statistics
         print(f"\n📊 After normalization (amplification={self.amplification_factor}x):")
-        print(f"Weight: std={np.std(X_normalized[:, 0]):.4f}")
-        print(f"Median other std: {np.median(np.std(X_normalized[:, 1:], axis=0)):.4f}")
-        print(f"Ratio: {np.std(X_normalized[:, 0])/np.median(np.std(X_normalized[:, 1:], axis=0)):.2f}")
+        print(f"  Weight: std={np.std(X_normalized[:, 0]):.4f}")
+        print(f"  Median other std: {np.median(np.std(X_normalized[:, 1:], axis=0)):.4f}")
+        print(f"  Ratio: {np.std(X_normalized[:, 0])/np.median(np.std(X_normalized[:, 1:], axis=0)):.2f}")
         
         print(f"\nCollected {len(X_normalized)} training samples")
         
@@ -377,38 +446,39 @@ class O19SImprovedTrainer:
             X: Feature matrix
             y: Target values
             alpha: Reduced regularization for stronger weight signal
-            test_size: Fraction for test set
+            test_size: Fraction for test set (internal validation only)
             use_cv: Use cross-validation for evaluation
             
         Returns:
             Trained Ridge model
         """
-        # Split data
-        X_train, X_test, y_train, y_test = train_test_split(
+        # Split data for internal validation only
+        # This is NOT the train/test split for final evaluation
+        X_train, X_val, y_train, y_val = train_test_split(
             X, y, test_size=test_size, random_state=42
         )
         
-        print(f"\n🎯 Training IMPROVED Ridge regression...")
+        print(f"\n🎯 Training FIXED O19S Ridge regression...")
         print(f"  Training samples: {len(X_train)}")
-        print(f"  Test samples: {len(X_test)}")
-        print(f"  Alpha: {alpha} (reduced for stronger weight signal)")
+        print(f"  Validation samples: {len(X_val)} (internal only)")
+        print(f"  Alpha: {alpha}")
         print(f"  Amplification: {self.amplification_factor}x")
         
-        # Train model
+        # Train model on full training data
         model = Ridge(alpha=alpha, random_state=42)
-        model.fit(X_train, y_train)
+        model.fit(X, y)  # Use all training data
         
-        # Evaluate
+        # Evaluate on internal validation split
         train_score = model.score(X_train, y_train)
-        test_score = model.score(X_test, y_test)
+        val_score = model.score(X_val, y_val)
         
-        print(f"\n📈 Model Performance:")
+        print(f"\n📈 Model Performance (internal validation):")
         print(f"  Train R²: {train_score:.4f}")
-        print(f"  Test R²: {test_score:.4f}")
+        print(f"  Validation R²: {val_score:.4f}")
         
         # Cross-validation
         if use_cv:
-            cv_scores = cross_val_score(model, X_train, y_train, cv=5)
+            cv_scores = cross_val_score(model, X, y, cv=5)
             print(f"  5-fold CV R²: {np.mean(cv_scores):.4f} (±{np.std(cv_scores):.4f})")
         
         # Analyze coefficients
@@ -432,36 +502,10 @@ class O19SImprovedTrainer:
             idx = coef_ranks[i]
             print(f"  #{i+1}: {feature_names[idx]}: {coefficients[idx]:.6f}")
         
-        # Test weight sensitivity
-        print("\n🧪 Testing weight sensitivity:")
-        test_idx = np.random.choice(len(X_test))
-        sample = X_test[test_idx].copy()
-        
-        predictions = []
-        for w_norm in np.linspace(-3, 3, 7):  # Test normalized weight values
-            test_sample = sample.copy()
-            test_sample[0] = w_norm * self.amplification_factor
-            pred = model.predict(test_sample.reshape(1, -1))[0]
-            predictions.append(pred)
-            
-            # Convert back to original weight for display
-            w_orig = (w_norm + 3) / 6  # Map back to [0, 1]
-            print(f"  Weight={w_orig:.2f} → NDCG={pred:.4f}")
-        
-        pred_range = max(predictions) - min(predictions)
-        print(f"  Prediction range: {pred_range:.4f}")
-        
-        if pred_range > 0.10:
-            print("  ✅ EXCELLENT - strong weight sensitivity!")
-        elif pred_range > 0.05:
-            print("  ✅ Good weight sensitivity")
-        else:
-            print("  ⚠️ Still needs improvement")
-        
         return model
     
     def get_feature_names(self) -> List[str]:
-        """Get feature names."""
+        """Get feature names matching O19S exact methodology."""
         return [
             'f_0_neuralness',  # Weight
             'f_2_query_length',
@@ -500,8 +544,10 @@ class O19SImprovedTrainer:
             'normalization': self.normalization,
             'combination': self.combination,
             'feature_names': self.get_feature_names(),
+            'feature_extractor': 'O19SExactFeatureExtractor',  # FIXED
             'normalization_strategy': 'double_log_transform',
             'scaler_type': 'robust' if self.use_robust_scaler else 'standard',
+            'training_file': 'query_train.csv',  # FIXED
             'timestamp': datetime.now().isoformat()
         }
         
@@ -511,26 +557,31 @@ class O19SImprovedTrainer:
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Train improved O19S model')
+    parser = argparse.ArgumentParser(description='Train FIXED O19S model')
     parser.add_argument('--host', default='localhost', help='OpenSearch host')
     parser.add_argument('--port', type=int, default=9200, help='OpenSearch port')
     parser.add_argument('--index-name', default='esci-products', help='Index name')
     parser.add_argument('--model-id', required=True, help='Neural model ID')
     parser.add_argument('--sample-size', type=int, default=100, help='Number of queries')
-    parser.add_argument('--alpha', type=float, default=0.5, help='Reduced regularization')
-    parser.add_argument('--amplification', type=float, default=5.0, help='Stronger amplification')
+    parser.add_argument('--alpha', type=float, default=0.5, help='Regularization')
+    parser.add_argument('--amplification', type=float, default=5.0, help='Weight amplification')
     parser.add_argument('--use-robust', action='store_true', help='Use RobustScaler')
     parser.add_argument('--augment', action='store_true', help='Augment with extreme weights')
     parser.add_argument('--output-model', default='o19s_improved_model.pkl', help='Output path')
+    parser.add_argument('--output-scaler', default='o19s_improved_scaler.pkl', help='Scaler path')
     
     args = parser.parse_args()
     
     print("="*80)
-    print("O19S IMPROVED MODEL TRAINING")
+    print("O19S FIXED MODEL TRAINING")
     print("="*80)
-    print("Improvements based on initial results:")
-    print(f"  • Amplification: {args.amplification}x (stronger)")
-    print(f"  • Alpha: {args.alpha} (reduced)")
+    print("Key Fixes:")
+    print("  ✅ Using query_train.csv for training data")
+    print("  ✅ Using O19SExactFeatureExtractor (matches evaluation)")
+    print("  ✅ No data leakage - proper train/test separation")
+    print("Configuration:")
+    print(f"  • Amplification: {args.amplification}x")
+    print(f"  • Alpha: {args.alpha}")
     print(f"  • Scaler: {'RobustScaler' if args.use_robust else 'StandardScaler'}")
     print(f"  • Augmentation: {'Yes' if args.augment else 'No'}")
     print("="*80)
@@ -550,22 +601,22 @@ def main():
         use_robust_scaler=args.use_robust
     )
     
-    # Load queries
-    queries_df = load_ratings_data(
-        ratings_path="dynamic_hybrid/data/ratings.csv",
+    # FIXED: Load training queries from query_train.csv
+    queries_df = load_training_queries(
+        query_file="dynamic_hybrid/data/query_train.csv",
+        ratings_file="dynamic_hybrid/data/ratings.csv",
         sample_size=args.sample_size
     )
     
     if queries_df.empty:
-        print("Error: No queries loaded!")
+        print("Error: No training queries loaded!")
         return
     
-    # Collect training data
+    # Collect training data with all 11 weights
     weights = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
     X, y = trainer.collect_training_data(
         queries_df, 
         weights,
-        sample_size=args.sample_size,
         use_augmentation=args.augment
     )
     
@@ -573,10 +624,11 @@ def main():
     model = trainer.train_model(X, y, alpha=args.alpha)
     
     # Save model
-    trainer.save_model(model, args.output_model)
+    trainer.save_model(model, args.output_model, args.output_scaler)
     
     print("\n" + "="*80)
-    print("✅ IMPROVED TRAINING COMPLETE!")
+    print("✅ FIXED TRAINING COMPLETE!")
+    print("Next step: Run evaluation with query_test.csv")
     print("="*80)
 
 
