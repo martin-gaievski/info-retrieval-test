@@ -159,7 +159,8 @@ class O19SWeightPredictorTrainer:
                              ratings_file: str,
                              sample_size: Optional[int] = None,
                              weights_to_test: Optional[List[float]] = None,
-                             use_fixed_queries: bool = False) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+                             use_fixed_queries: bool = False,
+                             data_source: str = 'csv') -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Collect training data for weight prediction.
         
@@ -169,11 +170,12 @@ class O19SWeightPredictorTrainer:
         3. Create training sample: 17 features -> best_weight
         
         Args:
-            o19s_data_path: Path to O19S data
-            ratings_file: Path to ratings file
+            o19s_data_path: Path to O19S data (for CSV) or base directory (for parquet)
+            ratings_file: Path to ratings file (for CSV mode)
             sample_size: Number of queries to use for training
             weights_to_test: Weights to test per query
             use_fixed_queries: If True, use fixed order from CSV
+            data_source: 'csv' for CSV files or 'parquet' for parquet files
             
         Returns:
             (X_features, y_weights, query_ids): Training features (17), target weights, and query IDs
@@ -184,43 +186,77 @@ class O19SWeightPredictorTrainer:
         
         logger.info(f"Collecting training data with weights: {weights_to_test}")
         logger.info(f"Predicting optimal weight (not NDCG) from 17 features")
+        logger.info(f"Data source: {data_source}")
         logger.info(f"Testing all 6 combinations: {self.NORMALIZATION_TECHNIQUES} × {self.COMBINATION_TECHNIQUES}")
         
-        # Load O19S data
-        train_file = Path(o19s_data_path) / 'query_train.csv'
-        if not train_file.exists():
-            raise FileNotFoundError(f"O19S train queries not found: {train_file}")
+        if data_source == 'parquet':
+            # Load from parquet files
+            logger.info("Loading data from parquet files...")
             
-        df_train = pd.read_csv(train_file)
-        
-        # Load ratings - Handle tab-delimited file with no headers
-        if not Path(ratings_file).exists():
-            raise FileNotFoundError(f"Ratings file not found: {ratings_file}")
+            # Load ESCI examples with query-product pairs and labels
+            examples_file = 'esci_data/shopping_queries_dataset_examples_us_small.parquet'
+            if not Path(examples_file).exists():
+                # Try larger file if small doesn't exist
+                examples_file = 'esci_data/shopping_queries_dataset_examples.parquet'
+                if not Path(examples_file).exists():
+                    raise FileNotFoundError(f"ESCI examples parquet not found")
             
-        logger.info(f"Loading ratings from: {ratings_file}")
-        df_ratings = pd.read_csv(ratings_file, sep='\t', header=None, 
-                               names=['query_string', 'product_id', 'esci_label', 'query_id'],
-                               on_bad_lines='skip')
-        
-        # Map numeric labels to rating scores
-        # The ratings file uses numeric labels (0,1,2,3) instead of ESCI labels
-        numeric_to_score = {
-            3: 1.0,    # Exact
-            2: 0.1,    # Substitute
-            1: 0.01,   # Complement
-            0: 0.0     # Irrelevant
-        }
-        
-        # First try to map as numeric, if that fails try as string
-        # Convert to numeric type first
-        df_ratings['esci_label_numeric'] = pd.to_numeric(df_ratings['esci_label'], errors='coerce')
-        
-        # If numeric conversion worked, use numeric mapping
-        if not df_ratings['esci_label_numeric'].isna().all():
-            df_ratings['rating'] = df_ratings['esci_label_numeric'].map(numeric_to_score)
-            logger.info(f"Using numeric label mapping (0,1,2,3) -> rating scores")
+            df_examples = pd.read_parquet(examples_file)
+            logger.info(f"Loaded {len(df_examples)} examples from {examples_file}")
+            
+            # Filter to training split if available
+            if 'split' in df_examples.columns:
+                # Check what splits are available
+                available_splits = df_examples['split'].unique()
+                logger.info(f"Available splits in parquet: {available_splits.tolist()}")
+                
+                # Try to use 'train' split first
+                df_train_examples = df_examples[df_examples['split'] == 'train']
+                if len(df_train_examples) == 0:
+                    # If no train split, try 'test' split
+                    df_train_examples = df_examples[df_examples['split'] == 'test']
+                    if len(df_train_examples) > 0:
+                        logger.info(f"No 'train' split found, using 'test' split with {len(df_train_examples)} examples")
+                    else:
+                        # If neither train nor test, use all data
+                        df_train_examples = df_examples
+                        logger.info(f"No standard splits found, using all {len(df_train_examples)} examples")
+                else:
+                    logger.info(f"Using 'train' split with {len(df_train_examples)} examples")
+            else:
+                df_train_examples = df_examples
+                logger.info(f"No split column found, using all {len(df_train_examples)} examples")
+            
+            # Create ratings dataframe from examples
+            df_ratings = df_train_examples[['query', 'product_id', 'esci_label']].copy()
+            df_ratings.columns = ['query_string', 'product_id', 'esci_label']
+            
+            # Get unique queries for training
+            train_queries = df_ratings['query_string'].unique().tolist()
+            logger.info(f"Found {len(train_queries)} unique queries in parquet data")
+            
         else:
-            # Fall back to ESCI letter mapping
+            # Original CSV loading logic
+            # Load O19S data
+            train_file = Path(o19s_data_path) / 'query_train.csv'
+            if not train_file.exists():
+                raise FileNotFoundError(f"O19S train queries not found: {train_file}")
+                
+            df_train = pd.read_csv(train_file)
+            train_queries = df_train['query_string'].tolist()
+            
+            # Load ratings - Handle tab-delimited file with no headers
+            if not Path(ratings_file).exists():
+                raise FileNotFoundError(f"Ratings file not found: {ratings_file}")
+                
+            logger.info(f"Loading ratings from: {ratings_file}")
+            df_ratings = pd.read_csv(ratings_file, sep='\t', header=None, 
+                                   names=['query_string', 'product_id', 'esci_label', 'query_id'],
+                                   on_bad_lines='skip')
+        
+        # Map labels to rating scores
+        if data_source == 'parquet':
+            # Parquet files use ESCI letter labels
             esci_to_numeric = {
                 'E': 1.0,    # Exact
                 'S': 0.1,    # Substitute
@@ -229,6 +265,33 @@ class O19SWeightPredictorTrainer:
             }
             df_ratings['rating'] = df_ratings['esci_label'].map(esci_to_numeric)
             logger.info(f"Using ESCI letter mapping (E,S,C,I) -> rating scores")
+        else:
+            # CSV files may use numeric labels (0,1,2,3) or ESCI labels
+            numeric_to_score = {
+                3: 1.0,    # Exact
+                2: 0.1,    # Substitute
+                1: 0.01,   # Complement
+                0: 0.0     # Irrelevant
+            }
+            
+            # First try to map as numeric, if that fails try as string
+            # Convert to numeric type first
+            df_ratings['esci_label_numeric'] = pd.to_numeric(df_ratings['esci_label'], errors='coerce')
+            
+            # If numeric conversion worked, use numeric mapping
+            if not df_ratings['esci_label_numeric'].isna().all():
+                df_ratings['rating'] = df_ratings['esci_label_numeric'].map(numeric_to_score)
+                logger.info(f"Using numeric label mapping (0,1,2,3) -> rating scores")
+            else:
+                # Fall back to ESCI letter mapping
+                esci_to_numeric = {
+                    'E': 1.0,    # Exact
+                    'S': 0.1,    # Substitute
+                    'C': 0.01,   # Complement
+                    'I': 0.0     # Irrelevant
+                }
+                df_ratings['rating'] = df_ratings['esci_label'].map(esci_to_numeric)
+                logger.info(f"Using ESCI letter mapping (E,S,C,I) -> rating scores")
         
         logger.info(f"Loaded {len(df_ratings)} rating entries")
         
@@ -254,22 +317,36 @@ class O19SWeightPredictorTrainer:
         
         logger.info(f"Created reference for {len(reference)} unique queries")
         
-        # Get training queries
-        train_queries = df_train['query_string'].tolist()
-        
-        if use_fixed_queries:
+        # Sample queries based on parameters
+        if data_source == 'parquet':
+            # For parquet, train_queries already contains unique queries
             if sample_size and sample_size < len(train_queries):
-                train_queries = train_queries[:sample_size]
-                logger.info(f"Using first {sample_size} queries from fixed dataset")
+                if use_fixed_queries:
+                    # Take first N queries
+                    train_queries = train_queries[:sample_size]
+                    logger.info(f"Using first {sample_size} queries from parquet dataset")
+                else:
+                    # Random sample
+                    np.random.seed(42)
+                    train_queries = np.random.choice(train_queries, size=sample_size, replace=False).tolist()
+                    logger.info(f"Randomly sampled {sample_size} queries from parquet")
             else:
-                logger.info(f"Using all {len(train_queries)} queries from fixed dataset")
+                logger.info(f"Using all {len(train_queries)} queries from parquet")
         else:
-            if sample_size and sample_size < len(train_queries):
-                np.random.seed(42)
-                train_queries = np.random.choice(train_queries, size=sample_size, replace=False).tolist()
-                logger.info(f"Randomly sampled {sample_size} training queries")
+            # Original CSV logic
+            if use_fixed_queries:
+                if sample_size and sample_size < len(train_queries):
+                    train_queries = train_queries[:sample_size]
+                    logger.info(f"Using first {sample_size} queries from fixed dataset")
+                else:
+                    logger.info(f"Using all {len(train_queries)} queries from fixed dataset")
             else:
-                logger.info(f"Using all {len(train_queries)} training queries")
+                if sample_size and sample_size < len(train_queries):
+                    np.random.seed(42)
+                    train_queries = np.random.choice(train_queries, size=sample_size, replace=False).tolist()
+                    logger.info(f"Randomly sampled {sample_size} training queries")
+                else:
+                    logger.info(f"Using all {len(train_queries)} training queries")
         
         # Filter to queries with ratings
         train_queries_with_ratings = [q for q in train_queries if q in reference]
@@ -872,7 +949,7 @@ def main():
     
     # Training parameters
     parser.add_argument('--sample-size', type=int, default=100,
-                       help='Number of queries for training')
+                       help='Number of queries for training (None = use all)')
     parser.add_argument('--weights', type=str, default='0.0,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0',
                        help='Comma-separated weights to test')
     parser.add_argument('--alpha', type=float, default=0.1,
@@ -882,7 +959,9 @@ def main():
     parser.add_argument('--use-cross-validation', action='store_true',
                        help='Use cross-validation')
     parser.add_argument('--use-fixed-queries', action='store_true',
-                       help='Use fixed query order from CSV')
+                       help='Use fixed query order from CSV/parquet')
+    parser.add_argument('--data-source', type=str, default='csv', choices=['csv', 'parquet'],
+                       help='Data source: csv (O19S CSV files) or parquet (ESCI parquet files)')
     
     # Output
     parser.add_argument('--output-model', type=str, 
@@ -909,6 +988,7 @@ def main():
     logger.info(f"Features: 17 (5 query + 12 corpus, NO weight feature)")
     logger.info(f"Model: Ridge regression with StandardScaler")
     logger.info(f"Alpha: {args.alpha}")
+    logger.info(f"Data source: {args.data_source}")
     logger.info("=" * 80)
     
     # Collect training data
@@ -917,7 +997,8 @@ def main():
         ratings_file=args.ratings_file,
         sample_size=args.sample_size,
         weights_to_test=weights_to_test,
-        use_fixed_queries=args.use_fixed_queries
+        use_fixed_queries=args.use_fixed_queries,
+        data_source=args.data_source
     )
     
     logger.info(f"\nTraining data collected:")

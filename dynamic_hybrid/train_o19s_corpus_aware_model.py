@@ -87,11 +87,13 @@ class O19SCorpusAwareTrainer:
                  corpus_field: str = "product_title"):
         """Initialize O19S corpus-aware trainer"""
         
+        # Configure for remote connection
+        use_ssl = port == 443 or port == 80
         self.client = OpenSearch(
             hosts=[{'host': host, 'port': port}],
             http_compress=True,
             http_auth=None,
-            use_ssl=False,
+            use_ssl=use_ssl,
             verify_certs=False,
             ssl_assert_hostname=False,
             ssl_show_warn=False,
@@ -575,10 +577,26 @@ class O19SCorpusAwareTrainer:
         # Convert to DataFrame for sklearn compatibility
         X_df = pd.DataFrame(X_features, columns=feature_names)
         
-        # Add feature normalization (O19S likely uses this for better numerical stability)
+        # SELECTIVE SCALING: Exclude weight feature (f_0_neuralness) from StandardScaler
+        # This preserves the natural [0,1] bounds of the weight feature while scaling others
+        logger.info("Applying selective scaling: preserving weight feature, scaling others...")
+        
+        # Separate weight feature from other features
+        weight_feature = X_df[['f_0_neuralness']].values  # Keep weight unscaled
+        other_features = X_df.drop('f_0_neuralness', axis=1)
+        
+        # Apply StandardScaler only to non-weight features  
         scaler = StandardScaler()
-        X_scaled = scaler.fit_transform(X_df)
+        other_features_scaled = scaler.fit_transform(other_features)
+        
+        # Recombine: unscaled weight + scaled other features
+        X_scaled = np.hstack([weight_feature, other_features_scaled])
+        
+        # Reconstruct DataFrame with all features
         X_df = pd.DataFrame(X_scaled, columns=feature_names)
+        
+        logger.info(f"  Weight feature (f_0_neuralness) preserved in range [{weight_feature.min():.2f}, {weight_feature.max():.2f}]")
+        logger.info(f"  Other {len(other_features.columns)} features scaled with StandardScaler")
         
         if query_ids is not None and len(np.unique(query_ids)) > 1:
             # O19S Query-based splitting: keep all samples from same query together
@@ -652,13 +670,19 @@ class O19SCorpusAwareTrainer:
         # Analyze feature coefficients (on original scale for interpretability)
         logger.info(f"\nFeature coefficients:")
         for i, (name, coef) in enumerate(zip(feature_names, model.coef_)):
-            # Adjust coefficient for scaled features
-            original_scale_coef = coef / scaler.scale_[i] if scaler.scale_[i] != 0 else coef
+            if name == 'f_0_neuralness':
+                # Weight feature was not scaled, so coefficient is already on original scale
+                original_scale_coef = coef
+            else:
+                # Other features were scaled, adjust coefficient to original scale
+                # The scaler only has 17 features (index 0-16), so adjust index
+                scaler_idx = i - 1  # Shift index since weight was removed from scaler
+                original_scale_coef = coef / scaler.scale_[scaler_idx] if scaler.scale_[scaler_idx] != 0 else coef
             logger.info(f"  {name}: {original_scale_coef:.6f}")
         logger.info(f"  Intercept: {model.intercept_:.6f}")
         
-        # Check weight sensitivity
-        weight_coef = model.coef_[0] / scaler.scale_[0] if scaler.scale_[0] != 0 else model.coef_[0]
+        # Check weight sensitivity (weight is at index 0 and wasn't scaled)
+        weight_coef = model.coef_[0]  # Already on original scale
         logger.info(f"\nWeight sensitivity: {abs(weight_coef):.6f}")
         if abs(weight_coef) < 0.01:
             logger.warning("⚠️  Model is not sensitive to weight changes!")
