@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
 """
-Train O19S Weight Predictor Model
+Train O19S Weight Predictor with Linear Regression (No Regularization)
 
-This script trains a Ridge regression model to predict optimal weight directly:
+This script trains a simple Linear Regression model (no regularization) to predict optimal weight:
 1. Uses 17 features (5 query + 12 real-time corpus features) - NO weight as feature
 2. For each query, finds the weight that produces highest NDCG
 3. Trains model to predict this optimal weight given the 17 features
 4. Target is the weight itself (not NDCG)
 
-This is different from original O19S which uses weight as input feature to predict NDCG.
-Here we predict the weight that maximizes NDCG.
+This version uses LinearRegression instead of Ridge to test if regularization is the problem.
 
 Author: Dynamic Hybrid Search Team  
-Version: 1.0.0 - Weight prediction model
+Version: 1.0.0 - Linear Regression (no regularization) version
 """
 
 import os
@@ -31,7 +30,7 @@ import time
 import string
 import re
 import itertools
-from sklearn.linear_model import Ridge
+from sklearn.linear_model import LinearRegression  # Using LinearRegression instead of Ridge
 from sklearn.model_selection import train_test_split, ShuffleSplit, cross_val_score
 from sklearn.metrics import mean_squared_error, r2_score, make_scorer
 from sklearn.preprocessing import StandardScaler
@@ -64,8 +63,8 @@ logging.basicConfig(format='%(asctime)s - %(message)s',
 logger = logging.getLogger(__name__)
 
 
-class O19SWeightPredictorTrainer:
-    """Train model to predict optimal weight directly (not NDCG)"""
+class O19SLinearRegressionTrainer:
+    """Train model to predict optimal weight using Linear Regression (no regularization)"""
     
     # O19S exact list of common English stopwords
     STOPWORDS = {
@@ -85,7 +84,7 @@ class O19SWeightPredictorTrainer:
                  index_name: str = "esci-products",
                  model_id: str = None,
                  corpus_field: str = "product_title"):
-        """Initialize weight predictor trainer"""
+        """Initialize linear regression trainer"""
         
         self.client = OpenSearch(
             hosts=[{'host': host, 'port': port}],
@@ -115,10 +114,10 @@ class O19SWeightPredictorTrainer:
         # Initialize corpus info
         self._initialize_corpus_info()
         
-        logger.info(f"Initialized O19S weight predictor trainer for {host}:{port}/{index_name}")
+        logger.info(f"Initialized O19S LINEAR REGRESSION trainer for {host}:{port}/{index_name}")
+        logger.info(f"Using LinearRegression (NO REGULARIZATION)")
         logger.info(f"Corpus field: {corpus_field}")
         logger.info(f"Total documents: {self._total_docs}")
-        logger.info(f"Will test {len(self.NORMALIZATION_TECHNIQUES)} normalizations × {len(self.COMBINATION_TECHNIQUES)} combinations = 6 total")
     
     def _initialize_corpus_info(self):
         """Initialize corpus information."""
@@ -184,7 +183,7 @@ class O19SWeightPredictorTrainer:
         
         logger.info(f"Collecting training data with weights: {weights_to_test}")
         logger.info(f"Predicting optimal weight (not NDCG) from 17 features")
-        logger.info(f"Testing all 6 combinations: {self.NORMALIZATION_TECHNIQUES} × {self.COMBINATION_TECHNIQUES}")
+        logger.info(f"Using LINEAR REGRESSION (no regularization)")
         
         # Load O19S data
         train_file = Path(o19s_data_path) / 'query_train.csv'
@@ -203,7 +202,6 @@ class O19SWeightPredictorTrainer:
                                on_bad_lines='skip')
         
         # Map numeric labels to rating scores
-        # The ratings file uses numeric labels (0,1,2,3) instead of ESCI labels
         numeric_to_score = {
             3: 1.0,    # Exact
             2: 0.1,    # Substitute
@@ -211,8 +209,7 @@ class O19SWeightPredictorTrainer:
             0: 0.0     # Irrelevant
         }
         
-        # First try to map as numeric, if that fails try as string
-        # Convert to numeric type first
+        # First try to map as numeric
         df_ratings['esci_label_numeric'] = pd.to_numeric(df_ratings['esci_label'], errors='coerce')
         
         # If numeric conversion worked, use numeric mapping
@@ -243,7 +240,6 @@ class O19SWeightPredictorTrainer:
         nan_count = df_ratings['rating'].isna().sum()
         if nan_count > 0:
             logger.warning(f"Found {nan_count} unmapped ratings (NaN values)")
-            # Show some examples of unmapped labels
             unmapped_samples = df_ratings[df_ratings['rating'].isna()].head(5)
             logger.warning(f"Sample unmapped labels: {unmapped_samples['esci_label'].tolist()}")
         
@@ -277,7 +273,7 @@ class O19SWeightPredictorTrainer:
         
         # Collect training samples
         X_features = []
-        y_weights = []  # Target is now weight, not NDCG
+        y_weights = []  # Target is weight, not NDCG
         query_ids = []
         
         logger.info(f"Expected training samples: {len(train_queries_with_ratings)} (one per query)")
@@ -300,7 +296,6 @@ class O19SWeightPredictorTrainer:
                 for weight in weights_to_test:
                     lexical_weight = round(1.0 - weight, 2)
                     
-
                     for normalization, combination in itertools.product(self.NORMALIZATION_TECHNIQUES, 
                                                                        self.COMBINATION_TECHNIQUES):
                         try:
@@ -349,21 +344,29 @@ class O19SWeightPredictorTrainer:
         logger.info(f"Unique queries in training data: {len(np.unique(query_ids))}")
         logger.info(f"Total combinations tested: {self.total_combinations_tested}")
         
-        # Report weight distribution in training data
+        # Report weight distribution in training data (EXACT VALUES)
         if y_weights:
-            weight_counts = pd.Series(y_weights).value_counts().sort_index()
-            logger.info("\nOptimal weight distribution in training data:")
+            weight_series = pd.Series(y_weights)
+            weight_counts = weight_series.value_counts().sort_index()
+            logger.info("\nOptimal weight distribution in training data (EXACT VALUES):")
             for weight, count in weight_counts.items():
                 percentage = (count / len(y_weights)) * 100
                 logger.info(f"  Weight {weight:.1f}: {count} queries ({percentage:.1f}%)")
-        
-        # Report statistics on which combinations were selected as best
-        logger.info("\nBest combination selection statistics:")
-        for norm in self.NORMALIZATION_TECHNIQUES:
-            for comb in self.COMBINATION_TECHNIQUES:
-                count = self.normalization_stats[norm][comb]
-                percentage = (count / samples_collected * 100) if samples_collected > 0 else 0
-                logger.info(f"  {norm}/{comb}: {count} times ({percentage:.1f}%)")
+            
+            # Add summary statistics
+            logger.info(f"\nTraining weights summary:")
+            logger.info(f"  Mean: {weight_series.mean():.3f}, Std: {weight_series.std():.3f}")
+            logger.info(f"  Min: {weight_series.min():.3f}, Max: {weight_series.max():.3f}")
+            logger.info(f"  Unique values: {len(weight_counts)}")
+            
+            # Show distribution at extremes
+            extreme_low = (weight_series <= 0.1).sum()
+            extreme_high = (weight_series >= 0.9).sum()
+            middle = ((weight_series > 0.1) & (weight_series < 0.9)).sum()
+            logger.info(f"\nWeight clustering analysis:")
+            logger.info(f"  Weights 0.0-0.1: {extreme_low} ({extreme_low/len(y_weights)*100:.1f}%)")
+            logger.info(f"  Weights 0.2-0.8: {middle} ({middle/len(y_weights)*100:.1f}%)")
+            logger.info(f"  Weights 0.9-1.0: {extreme_high} ({extreme_high/len(y_weights)*100:.1f}%)")
         
         if samples_collected == 0:
             raise ValueError("No training samples collected")
@@ -532,29 +535,29 @@ class O19SWeightPredictorTrainer:
                    X_features: np.ndarray,
                    y_weights: np.ndarray,
                    query_ids: np.ndarray = None,
-                   alpha: float = 1.0,
                    test_size: float = 0.2,
-                   use_cross_validation: bool = True) -> Ridge:
+                   use_cross_validation: bool = True) -> LinearRegression:
         """
-        Train Ridge regression model to predict optimal weight.
+        Train Linear Regression model to predict optimal weight.
         
         Args:
             X_features: Feature matrix (samples x 17 features)
             y_weights: Target weight values (what we're predicting)
             query_ids: Query identifiers for each sample
-            alpha: Ridge regularization parameter (lower than O19S since different target)
             test_size: Fraction for validation split
             use_cross_validation: If True, use ShuffleSplit cross-validation
             
         Returns:
-            Trained Ridge regression model with feature scaler
+            Trained Linear Regression model with feature scaler
         """
         
-        logger.info(f"Training Ridge regression model to predict optimal weight...")
+        logger.info(f"\n{'='*60}")
+        logger.info(f"Training LINEAR REGRESSION model (NO REGULARIZATION)")
+        logger.info(f"{'='*60}")
         logger.info(f"  Training samples: {len(X_features)}")
         logger.info(f"  Features: {X_features.shape[1]} (no weight feature)")
         logger.info(f"  Target: optimal weight (not NDCG)")
-        logger.info(f"  Alpha (regularization): {alpha}")
+        logger.info(f"  Model: LinearRegression (no alpha/regularization)")
         logger.info(f"  Test split: {test_size}")
         logger.info(f"  Cross-validation: {use_cross_validation}")
         
@@ -571,7 +574,7 @@ class O19SWeightPredictorTrainer:
         # Convert to DataFrame for sklearn compatibility
         X_df = pd.DataFrame(X_features, columns=feature_names)
         
-        # Apply StandardScaler to ALL features (no selective scaling needed since no weight feature)
+        # Apply StandardScaler to ALL features
         logger.info("Applying StandardScaler to all 17 features...")
         scaler = StandardScaler()
         X_scaled = scaler.fit_transform(X_df)
@@ -610,8 +613,9 @@ class O19SWeightPredictorTrainer:
         # Check if we have enough samples for train/test split
         min_samples_for_split = 5  # Minimum samples needed for meaningful split
         
-        # Train Ridge regression model
-        model = Ridge(alpha=alpha, solver='auto', random_state=0)
+        # Train Linear Regression model (NO REGULARIZATION)
+        model = LinearRegression()
+        logger.info("\n⚠️  Using LinearRegression - NO regularization penalty")
         
         if len(X_train) < min_samples_for_split or len(X_test) == 0:
             # Too few samples for proper evaluation, train on all data
@@ -651,112 +655,109 @@ class O19SWeightPredictorTrainer:
                 try:
                     cv_scores = cross_val_score(model, X_df, y_weights, cv=cv, scoring=rmse_scorer)
                     logger.info(f"  Cross-validation RMSE: {-cv_scores.mean():.6f} (+/- {cv_scores.std() * 2:.6f})")
-                    
-                    # Also evaluate with R² scoring
-                    cv_r2_scores = cross_val_score(model, X_df, y_weights, cv=cv, scoring='r2')
-                    logger.info(f"  Cross-validation R²: {cv_r2_scores.mean():.6f} (+/- {cv_r2_scores.std() * 2:.6f})")
                 except Exception as e:
                     logger.warning(f"Cross-validation failed: {e}")
             
-            # Fit final model on training data
+            # Fit the model
             model.fit(X_train, y_train)
             
-            # Validate model
+            # Predictions
             y_pred_train = model.predict(X_train)
             y_pred_test = model.predict(X_test)
             
-            # Clip predictions to valid weight range [0, 1]
+            # Clip predictions to [0, 1] range
             y_pred_train = np.clip(y_pred_train, 0.0, 1.0)
             y_pred_test = np.clip(y_pred_test, 0.0, 1.0)
             
+            # Calculate metrics
             train_mse = mean_squared_error(y_train, y_pred_train)
-            test_mse = mean_squared_error(y_test, y_pred_test)
             train_rmse = root_mean_squared_error(y_train, y_pred_train)
-            test_rmse = root_mean_squared_error(y_test, y_pred_test)
             train_r2 = r2_score(y_train, y_pred_train)
+            
+            test_mse = mean_squared_error(y_test, y_pred_test)
+            test_rmse = root_mean_squared_error(y_test, y_pred_test)
             test_r2 = r2_score(y_test, y_pred_test)
             
-            logger.info(f"\nFinal model performance (predicting weight):")
-            logger.info(f"  Train MSE: {train_mse:.6f}, RMSE: {train_rmse:.6f}")
-            logger.info(f"  Test MSE: {test_mse:.6f}, RMSE: {test_rmse:.6f}")
-            logger.info(f"  Train R²: {train_r2:.6f}")
-            logger.info(f"  Test R²: {test_r2:.6f}")
+            logger.info(f"\nModel performance (LinearRegression - NO regularization):")
+            logger.info(f"  Train - MSE: {train_mse:.6f}, RMSE: {train_rmse:.6f}, R²: {train_r2:.6f}")
+            logger.info(f"  Test  - MSE: {test_mse:.6f}, RMSE: {test_rmse:.6f}, R²: {test_r2:.6f}")
         
-        # Analyze feature importance via coefficients
-        logger.info(f"\nFeature coefficients (importance for weight prediction):")
-        feature_importance = []
-        for i, (name, coef) in enumerate(zip(feature_names, model.coef_)):
-            # Adjust coefficient to original scale
-            original_scale_coef = coef / scaler.scale_[i] if scaler.scale_[i] != 0 else coef
-            feature_importance.append((name, abs(original_scale_coef)))
-            logger.info(f"  {name}: {coef:.6f} (scaled), {original_scale_coef:.6f} (original scale)")
+        # Feature importance analysis (coefficients)
+        coefficients = model.coef_
+        feature_importance = pd.DataFrame({
+            'feature': feature_names,
+            'coefficient': coefficients,
+            'abs_coefficient': np.abs(coefficients)
+        }).sort_values('abs_coefficient', ascending=False)
         
-        # Sort by importance (absolute value)
-        feature_importance.sort(key=lambda x: x[1], reverse=True)
+        logger.info("\nTop feature coefficients (LinearRegression):")
+        for idx, row in feature_importance.head(10).iterrows():
+            logger.info(f"  {row['feature']}: {row['coefficient']:.6f}")
         
-        logger.info(f"\nTop features for weight prediction (by importance):")
-        for i, (name, importance) in enumerate(feature_importance[:10], 1):
-            logger.info(f"  {i}. {name}: {importance:.6f}")
+        # Analyze prediction distribution
+        logger.info("\n" + "="*60)
+        logger.info("PREDICTION ANALYSIS (LinearRegression)")
+        logger.info("="*60)
         
-        # Analyze prediction distribution (only if we have test data)
-        if len(y_pred_test) > 0:
-            logger.info(f"\nPredicted weight distribution on evaluation set:")
-            predicted_weights = np.round(y_pred_test, 1)  # Round to nearest 0.1
-            weight_counts = pd.Series(predicted_weights).value_counts().sort_index()
-            for weight, count in weight_counts.items():
-                percentage = (count / len(y_pred_test)) * 100
-                logger.info(f"  Weight {weight:.1f}: {count} predictions ({percentage:.1f}%)")
+        if 'y_test' in locals() and len(y_test) > 0:
+            # Analyze exact weight values (rounded to 1 decimal place for clarity)
+            test_actual_weights = pd.Series(y_test).round(1)
+            test_pred_weights = pd.Series(y_pred_test).round(2)  # Round predictions to 2 decimals for more detail
             
-            # Compare with actual distribution
-            logger.info(f"\nActual weight distribution in evaluation set:")
-            actual_weights = np.round(y_test, 1)
-            actual_counts = pd.Series(actual_weights).value_counts().sort_index()
+            logger.info("\nTest set weight distributions (EXACT VALUES):")
+            logger.info("\nActual optimal weights:")
+            actual_counts = test_actual_weights.value_counts().sort_index()
             for weight, count in actual_counts.items():
                 percentage = (count / len(y_test)) * 100
                 logger.info(f"  Weight {weight:.1f}: {count} samples ({percentage:.1f}%)")
+            
+            logger.info(f"\nActual weights summary:")
+            logger.info(f"  Mean: {y_test.mean():.3f}, Std: {y_test.std():.3f}")
+            logger.info(f"  Min: {y_test.min():.3f}, Max: {y_test.max():.3f}")
+            logger.info(f"  Unique values: {len(test_actual_weights.unique())}")
+            
+            logger.info("\nPredicted weights (LinearRegression):")
+            # Group predictions into ranges for readability (0.1 intervals)
+            pred_rounded = (test_pred_weights * 10).round() / 10  # Round to nearest 0.1
+            pred_counts = pred_rounded.value_counts().sort_index()
+            for weight, count in pred_counts.items():
+                percentage = (count / len(y_pred_test)) * 100
+                # Show actual range of predictions for this rounded value
+                mask = (pred_rounded == weight)
+                actual_range = test_pred_weights[mask]
+                logger.info(f"  Weight ~{weight:.1f}: {count} samples ({percentage:.1f}%) [actual range: {actual_range.min():.3f}-{actual_range.max():.3f}]")
+            
+            logger.info(f"\nPredicted weights summary:")
+            logger.info(f"  Mean: {y_pred_test.mean():.3f}, Std: {y_pred_test.std():.3f}")
+            logger.info(f"  Min: {y_pred_test.min():.3f}, Max: {y_pred_test.max():.3f}")
+            logger.info(f"  Unique values (rounded to 0.1): {len(pred_rounded.unique())}")
+            
+            # Check for mean collapse problem
+            pred_std = np.std(y_pred_test)
+            actual_std = np.std(y_test)
+            logger.info(f"\nStandard deviation comparison:")
+            logger.info(f"  Actual weights: {actual_std:.4f}")
+            logger.info(f"  Predicted weights: {pred_std:.4f}")
+            logger.info(f"  Ratio (predicted/actual): {pred_std/actual_std:.2f}")
+            
+            if pred_std/actual_std < 0.5:
+                logger.warning("⚠️  MEAN COLLAPSE DETECTED: Predictions have much lower variance than actual!")
+                logger.warning("    LinearRegression (like Ridge) is collapsing to mean values")
         
-        # Store scaler with model
+        # Store model with scaler
         model.scaler = scaler
         model.feature_names = feature_names
         
         return model
     
-    def save_model(self, model: Ridge, output_path: str):
-        """Save trained model and metadata."""
-        
-        # Save model with pickle
-        with open(output_path, 'wb') as f:
-            pickle.dump(model, f)
-        
-        # Save metadata
-        metadata = {
-            'model_type': 'Ridge',
-            'target': 'weight',
-            'features': model.feature_names if hasattr(model, 'feature_names') else [],
-            'num_features': len(model.coef_),
-            'alpha': model.alpha,
-            'intercept': float(model.intercept_),
-            'coefficients': model.coef_.tolist(),
-            'scaler_params': {
-                'mean': model.scaler.mean_.tolist() if hasattr(model, 'scaler') else [],
-                'scale': model.scaler.scale_.tolist() if hasattr(model, 'scaler') else []
-            }
-        }
-        
-        metadata_path = output_path.replace('.pkl', '_metadata.json')
-        with open(metadata_path, 'w') as f:
-            json.dump(metadata, f, indent=2)
-        
-        logger.info(f"Model saved to: {output_path}")
-        logger.info(f"Metadata saved to: {metadata_path}")
-    
     def _execute_hybrid_search(self, query: str, lexical_weight: float, neural_weight: float,
-                              normalization_technique: str, combination_technique: str) -> pd.DataFrame:
-        """Execute O19S hybrid search with specific normalization/combination."""
+                               normalization: str, combination: str) -> pd.DataFrame:
+        """Execute hybrid search with specific normalization/combination."""
         
-        # Build payload with the ACTUAL normalization and combination parameters
-        payload = {
-            "_source": {"excludes": ["title_embedding"]},
+        # Build hybrid query
+        hybrid_query = {
+            "_source": {"exclude": ["title_embedding"]},
+            "size": 100,
             "query": {
                 "hybrid": {
                     "queries": [
@@ -766,12 +767,11 @@ class O19SWeightPredictorTrainer:
                                 "type": "best_fields",
                                 "operator": "and",
                                 "fields": [
-                                    "product_id^100",
-                                    "product_bullet_point^3", 
-                                    "product_color^2",
-                                    "product_brand^5",
+                                    "product_title^10",
+                                    "product_bullet_points^3", 
                                     "product_description",
-                                    "product_title^10"
+                                    "product_brand^5",
+                                    "product_color^2"
                                 ]
                             }
                         },
@@ -786,108 +786,120 @@ class O19SWeightPredictorTrainer:
                         }
                     ]
                 }
-            },
-            "search_pipeline": {
-                "description": f"O19S weight predictor with {normalization_technique}/{combination_technique}",
-                "phase_results_processors": [
-                    {
-                        "normalization-processor": {
-                            "normalization": {"technique": normalization_technique},  # USE PARAMETER
-                            "combination": {
-                                "technique": combination_technique,  # USE PARAMETER
-                                "parameters": {"weights": [lexical_weight, neural_weight]}
+            }
+        }
+        
+        # Add normalization and combination technique
+        hybrid_query["search_pipeline"] = {
+            "phase_results_processors": [
+                {
+                    "normalization-processor": {
+                        "normalization": {
+                            "technique": normalization
+                        },
+                        "combination": {
+                            "technique": combination,
+                            "parameters": {
+                                "weights": [lexical_weight, neural_weight]
                             }
                         }
                     }
-                ]
-            },
-            "size": 100
+                }
+            ]
         }
-            
+        
         try:
-            # Execute search
-            response = self.client.search(index=self.index_name, body=payload)
+            response = self.client.search(index=self.index_name, body=hybrid_query)
             
-            # Parse results
+            # Extract results
             results = []
-            for position, hit in enumerate(response['hits']['hits']):
+            for hit in response['hits']['hits']:
                 results.append({
-                    #'docid': hit['_source'].get('product_id', hit['_id']),
-                    'product_id': hit['_source'].get('product_id', hit['_id']),
-                    'score': hit['_score'],
-                    'rank': len(results) + 1
+                    'docid': hit['_source'].get('product_id', hit['_id']),
+                    'score': hit['_score']
                 })
             
-            return pd.DataFrame(results) if results else pd.DataFrame()
+            return pd.DataFrame(results)
             
         except Exception as e:
-            logger.debug(f"Search failed for query '{query[:30]}...': {e}")
+            logger.debug(f"Hybrid search failed: {e}")
             return pd.DataFrame()
     
-    def _merge_results_with_reference(self, search_results: pd.DataFrame, reference_ratings: pd.DataFrame) -> pd.DataFrame:
-        """Merge search results with reference ratings"""
+    def _merge_results_with_reference(self, search_results: pd.DataFrame, reference: pd.DataFrame) -> pd.DataFrame:
+        """Merge search results with reference ratings."""
         
-        if search_results.empty or reference_ratings.empty:
+        if search_results.empty or reference.empty:
             return pd.DataFrame()
-            
-        # Merge on product_id = docid
-        merged = search_results.merge(
-            reference_ratings,
-            left_on='product_id',
-            right_on='docid',
-            how='left'
-        )
+        
+        # Merge on docid
+        merged = search_results.merge(reference, on='docid', how='left')
         
         # Fill missing ratings with 0
-        merged['rating'] = merged['rating'].fillna(0)
+        merged['rating'] = merged['rating'].fillna(0.0)
         
-        # Rename 'rank' to 'position' for metrics.ndcg_at_10() compatibility
-        merged['position'] = merged['rank']
+        # Add position column (1-based) for metrics.ndcg_at_10
+        merged['position'] = range(1, len(merged) + 1)
         
-        # Return with correct column names expected by metrics.ndcg_at_10()
-        return merged[['position', 'rating', 'product_id']]
+        return merged[['docid', 'score', 'rating', 'position']]
+    
+    def save_model(self, model, output_path: str):
+        """Save trained model and metadata."""
+        
+        # Save model
+        with open(output_path, 'wb') as f:
+            pickle.dump(model, f)
+        logger.info(f"Saved LinearRegression model to: {output_path}")
+        
+        # Save metadata
+        metadata = {
+            'model_type': 'LinearRegression',
+            'regularization': 'None',
+            'n_features': len(model.feature_names),
+            'feature_names': model.feature_names,
+            'coefficients': model.coef_.tolist(),
+            'intercept': float(model.intercept_),
+            'host': self.host,
+            'port': self.port,
+            'index_name': self.index_name,
+            'model_id': self.model_id
+        }
+        
+        metadata_path = output_path.replace('.pkl', '_metadata.json')
+        with open(metadata_path, 'w') as f:
+            json.dump(metadata, f, indent=2)
+        logger.info(f"Saved metadata to: {metadata_path}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Train O19S Weight Predictor Model')
+    """Main training function."""
     
-    # OpenSearch connection
-    parser.add_argument('--host', type=str, default='localhost',
+    parser = argparse.ArgumentParser(description='Train O19S Linear Regression Weight Predictor')
+    
+    # Connection parameters
+    parser.add_argument('--host', default='localhost',
                        help='OpenSearch host')
     parser.add_argument('--port', type=int, default=9200,
                        help='OpenSearch port')
-    parser.add_argument('--index-name', type=str, default='esci-products',
+    parser.add_argument('--index-name', default='esci-products',
                        help='Index name')
-    parser.add_argument('--model-id', type=str, 
-                       default='huggingface/sentence-transformers/all-MiniLM-L6-v2',
-                       help='Neural model ID')
-    
-    # Data paths
-    parser.add_argument('--o19s-data-path', type=str, 
-                       default='dynamic_hybrid/data',
-                       help='Path to O19S data directory')
-    parser.add_argument('--ratings-file', type=str,
-                       default='dynamic_hybrid/data/ratings.csv',
-                       help='Path to ratings file')
+    parser.add_argument('--model-id', required=True,
+                       help='Neural model ID for hybrid search')
     
     # Training parameters
+    parser.add_argument('--o19s-data-path', default='dynamic_hybrid/data',
+                       help='Path to O19S data directory')
+    parser.add_argument('--ratings-file', default='dynamic_hybrid/data/ratings.csv',
+                       help='Path to ESCI ratings file')
     parser.add_argument('--sample-size', type=int, default=100,
                        help='Number of queries for training')
     parser.add_argument('--weights', type=str, default='0.0,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0',
                        help='Comma-separated weights to test')
-    parser.add_argument('--alpha', type=float, default=0.1,
-                       help='Ridge regularization parameter (lower for weight prediction)')
     parser.add_argument('--test-size', type=float, default=0.2,
-                       help='Test set fraction')
-    parser.add_argument('--use-cross-validation', action='store_true',
-                       help='Use cross-validation')
+                       help='Test split ratio')
     parser.add_argument('--use-fixed-queries', action='store_true',
                        help='Use fixed query order from CSV')
-    
-    # Output
-    parser.add_argument('--output-model', type=str, 
-                       default='o19s_weight_predictor_model.pkl',
-                       help='Output model file')
+    parser.add_argument('--output-path', default='o19s_linear_regression_model.pkl',
+                       help='Output path for trained model')
     
     args = parser.parse_args()
     
@@ -895,23 +907,18 @@ def main():
     weights_to_test = [float(w) for w in args.weights.split(',')]
     
     # Initialize trainer
-    trainer = O19SWeightPredictorTrainer(
+    trainer = O19SLinearRegressionTrainer(
         host=args.host,
         port=args.port,
         index_name=args.index_name,
         model_id=args.model_id
     )
     
-    logger.info("=" * 80)
-    logger.info("O19S Weight Predictor Model Training")
-    logger.info("=" * 80)
-    logger.info(f"Target: Predict optimal weight directly (not NDCG)")
-    logger.info(f"Features: 17 (5 query + 12 corpus, NO weight feature)")
-    logger.info(f"Model: Ridge regression with StandardScaler")
-    logger.info(f"Alpha: {args.alpha}")
-    logger.info("=" * 80)
-    
     # Collect training data
+    logger.info("\n" + "="*60)
+    logger.info("COLLECTING TRAINING DATA FOR LINEAR REGRESSION")
+    logger.info("="*60)
+    
     X_features, y_weights, query_ids = trainer.collect_training_data(
         o19s_data_path=args.o19s_data_path,
         ratings_file=args.ratings_file,
@@ -920,30 +927,30 @@ def main():
         use_fixed_queries=args.use_fixed_queries
     )
     
-    logger.info(f"\nTraining data collected:")
-    logger.info(f"  Samples: {len(X_features)}")
-    logger.info(f"  Features: {X_features.shape[1]}")
-    logger.info(f"  Target range: [{y_weights.min():.2f}, {y_weights.max():.2f}]")
-    
     # Train model
+    logger.info("\n" + "="*60)
+    logger.info("TRAINING LINEAR REGRESSION MODEL")
+    logger.info("="*60)
+    
     model = trainer.train_model(
         X_features=X_features,
         y_weights=y_weights,
         query_ids=query_ids,
-        alpha=args.alpha,
         test_size=args.test_size,
-        use_cross_validation=args.use_cross_validation
+        use_cross_validation=True
     )
     
     # Save model
-    trainer.save_model(model, args.output_model)
+    trainer.save_model(model, args.output_path)
     
-    logger.info("\n" + "=" * 80)
-    logger.info("Training Complete!")
-    logger.info("=" * 80)
-    logger.info(f"Model saved to: {args.output_model}")
-    logger.info("Use the corresponding evaluation script to test the model")
-    logger.info("=" * 80)
+    logger.info("\n" + "="*60)
+    logger.info("LINEAR REGRESSION TRAINING COMPLETE")
+    logger.info("="*60)
+    logger.info(f"Model saved to: {args.output_path}")
+    logger.info("\nCompare with Ridge regression results:")
+    logger.info("  - Check if removing regularization improves R² scores")
+    logger.info("  - Check if prediction distribution is less collapsed")
+    logger.info("  - Evaluate with evaluate_o19s_weight_predictor.py")
 
 
 if __name__ == "__main__":

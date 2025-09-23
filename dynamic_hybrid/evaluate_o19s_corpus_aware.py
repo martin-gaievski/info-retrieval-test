@@ -539,7 +539,9 @@ class O19SCorpusAwareEvaluator:
             
             # Apply scaler if available (from new training format)
             if hasattr(self, 'scaler') and self.scaler is not None:
-                feature_df = pd.DataFrame(self.scaler.transform(feature_df), columns=feature_names)
+                # Apply scaler to ALL features (no selective scaling - all features scaled identically)
+                feature_scaled = self.scaler.transform(feature_df)
+                feature_df = pd.DataFrame(feature_scaled, columns=feature_names)
             
             # Predict NDCG for this weight
             predicted_ndcg = self.model.predict(feature_df)[0]
