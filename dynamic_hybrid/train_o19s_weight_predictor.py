@@ -194,7 +194,8 @@ class O19SWeightPredictorTrainer:
             logger.info("Loading data from parquet files...")
             
             # Load ESCI examples with query-product pairs and labels
-            examples_file = 'esci_data/shopping_queries_dataset_examples_us_small.parquet'
+            #examples_file = 'esci_data/shopping_queries_dataset_examples_us_small.parquet'
+            examples_file = 'esci_data/shopping_queries_dataset_examples.parquet'
             if not Path(examples_file).exists():
                 # Try larger file if small doesn't exist
                 examples_file = 'esci_data/shopping_queries_dataset_examples.parquet'
@@ -245,14 +246,27 @@ class O19SWeightPredictorTrainer:
             df_train = pd.read_csv(train_file)
             train_queries = df_train['query_string'].tolist()
             
-            # Load ratings - Handle tab-delimited file with no headers
+            # Load ratings - Handle CSV file with headers
             if not Path(ratings_file).exists():
                 raise FileNotFoundError(f"Ratings file not found: {ratings_file}")
                 
             logger.info(f"Loading ratings from: {ratings_file}")
-            df_ratings = pd.read_csv(ratings_file, sep='\t', header=None, 
-                                   names=['query_string', 'product_id', 'esci_label', 'query_id'],
-                                   on_bad_lines='skip')
+            # Check if file has headers by reading first line
+            with open(ratings_file, 'r') as f:
+                first_line = f.readline().strip()
+                has_header = 'query' in first_line.lower() or 'product' in first_line.lower()
+            
+            if has_header:
+                # File has headers - read normally
+                df_ratings = pd.read_csv(ratings_file)
+                # Rename columns to match expected format
+                if 'query' in df_ratings.columns:
+                    df_ratings = df_ratings.rename(columns={'query': 'query_string'})
+            else:
+                # File has no headers - assume tab-delimited format
+                df_ratings = pd.read_csv(ratings_file, sep='\t', header=None, 
+                                       names=['query_string', 'product_id', 'esci_label', 'query_id'],
+                                       on_bad_lines='skip')
         
         # Map labels to rating scores
         if data_source == 'parquet':
@@ -266,32 +280,49 @@ class O19SWeightPredictorTrainer:
             df_ratings['rating'] = df_ratings['esci_label'].map(esci_to_numeric)
             logger.info(f"Using ESCI letter mapping (E,S,C,I) -> rating scores")
         else:
-            # CSV files may use numeric labels (0,1,2,3) or ESCI labels
-            numeric_to_score = {
-                3: 1.0,    # Exact
-                2: 0.1,    # Substitute
-                1: 0.01,   # Complement
-                0: 0.0     # Irrelevant
-            }
-            
-            # First try to map as numeric, if that fails try as string
-            # Convert to numeric type first
-            df_ratings['esci_label_numeric'] = pd.to_numeric(df_ratings['esci_label'], errors='coerce')
-            
-            # If numeric conversion worked, use numeric mapping
-            if not df_ratings['esci_label_numeric'].isna().all():
-                df_ratings['rating'] = df_ratings['esci_label_numeric'].map(numeric_to_score)
-                logger.info(f"Using numeric label mapping (0,1,2,3) -> rating scores")
-            else:
-                # Fall back to ESCI letter mapping
-                esci_to_numeric = {
-                    'E': 1.0,    # Exact
-                    'S': 0.1,    # Substitute
-                    'C': 0.01,   # Complement
-                    'I': 0.0     # Irrelevant
+            # CSV files may already have 'rating' column with numeric values
+            if 'rating' in df_ratings.columns:
+                # Rating column already exists - just map to NDCG scores
+                numeric_to_score = {
+                    3: 1.0,    # Exact
+                    2: 0.1,    # Substitute
+                    1: 0.01,   # Complement
+                    0: 0.0     # Irrelevant
                 }
-                df_ratings['rating'] = df_ratings['esci_label'].map(esci_to_numeric)
-                logger.info(f"Using ESCI letter mapping (E,S,C,I) -> rating scores")
+                # Convert rating to numeric if it's not already
+                df_ratings['rating'] = pd.to_numeric(df_ratings['rating'], errors='coerce')
+                # Map to NDCG scores
+                df_ratings['rating'] = df_ratings['rating'].map(numeric_to_score)
+                logger.info(f"Using existing numeric ratings (0,1,2,3) -> NDCG scores")
+            elif 'esci_label' in df_ratings.columns:
+                # Try to map from esci_label column
+                # First try numeric mapping
+                numeric_to_score = {
+                    3: 1.0,    # Exact
+                    2: 0.1,    # Substitute
+                    1: 0.01,   # Complement
+                    0: 0.0     # Irrelevant
+                }
+                
+                # Try to convert to numeric
+                df_ratings['esci_label_numeric'] = pd.to_numeric(df_ratings['esci_label'], errors='coerce')
+                
+                # If numeric conversion worked, use numeric mapping
+                if not df_ratings['esci_label_numeric'].isna().all():
+                    df_ratings['rating'] = df_ratings['esci_label_numeric'].map(numeric_to_score)
+                    logger.info(f"Using numeric label mapping (0,1,2,3) -> NDCG scores")
+                else:
+                    # Fall back to ESCI letter mapping
+                    esci_to_numeric = {
+                        'E': 1.0,    # Exact
+                        'S': 0.1,    # Substitute
+                        'C': 0.01,   # Complement
+                        'I': 0.0     # Irrelevant
+                    }
+                    df_ratings['rating'] = df_ratings['esci_label'].map(esci_to_numeric)
+                    logger.info(f"Using ESCI letter mapping (E,S,C,I) -> NDCG scores")
+            else:
+                raise ValueError("No 'rating' or 'esci_label' column found in ratings file")
         
         logger.info(f"Loaded {len(df_ratings)} rating entries")
         
@@ -422,8 +453,11 @@ class O19SWeightPredictorTrainer:
                 logger.warning(f"Failed to collect sample for query '{query_string}': {e}")
                 continue
         
+        # Store total queries for later reporting
+        self.total_queries_used = len(np.unique(query_ids)) if query_ids else 0
+        
         logger.info(f"Collected {samples_collected} training samples (one per query)")
-        logger.info(f"Unique queries in training data: {len(np.unique(query_ids))}")
+        logger.info(f"Total unique queries used for training: {self.total_queries_used}")
         logger.info(f"Total combinations tested: {self.total_combinations_tested}")
         
         # Report weight distribution in training data
@@ -948,7 +982,7 @@ def main():
                        help='Path to ratings file')
     
     # Training parameters
-    parser.add_argument('--sample-size', type=int, default=100,
+    parser.add_argument('--sample-size', type=int,
                        help='Number of queries for training (None = use all)')
     parser.add_argument('--weights', type=str, default='0.0,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0',
                        help='Comma-separated weights to test')
@@ -1020,9 +1054,14 @@ def main():
     trainer.save_model(model, args.output_model)
     
     logger.info("\n" + "=" * 80)
-    logger.info("Training Complete!")
+    logger.info("Training Complete - Summary")
     logger.info("=" * 80)
+    logger.info(f"Total unique queries used for training: {trainer.total_queries_used}")
+    logger.info(f"Total training samples collected: {len(X_features)}")
     logger.info(f"Model saved to: {args.output_model}")
+    logger.info(f"Remote OpenSearch: {args.host}:{args.port}")
+    logger.info(f"Index: {args.index_name}")
+    logger.info(f"Model ID: {args.model_id}")
     logger.info("Use the corresponding evaluation script to test the model")
     logger.info("=" * 80)
 
