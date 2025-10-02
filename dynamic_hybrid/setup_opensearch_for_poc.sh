@@ -28,7 +28,7 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: $0 [OPTIONS]"
             echo ""
             echo "Options:"
-            echo "  -d, --dataset DATASET    Dataset name (e.g., scifact, scidocs, esci-product)"
+            echo "  -d, --dataset DATASET    Dataset name (e.g., scifact, scidocs, esci-products)"
             echo "  -h, --host HOST          OpenSearch host (default: localhost)"
             echo "  -p, --port PORT          OpenSearch port (default: 9200)"
             echo "  -i, --index INDEX        Index name (default: my-nlp-index-1 or esci-products for ESCI)"
@@ -36,8 +36,8 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "Example:"
             echo "  $0 --dataset scifact --host myserver.com --port 9201"
-            echo "  $0 --dataset esci-product    # Uses special ESCI ingestion script"
-            echo "  $0 --dataset esci-product --index custom-esci-index"
+            echo "  $0 --dataset esci-products    # Uses special ESCI ingestion script"
+            echo "  $0 --dataset esci-products --index custom-esci-index"
             exit 0
             ;;
         *)
@@ -50,7 +50,7 @@ done
 
 # Set default index name based on dataset
 if [ -z "$INDEX_NAME" ]; then
-    if [ "$DATASET_NAME" = "esci-product" ]; then
+    if [ "$DATASET_NAME" = "esci-products" ]; then
         INDEX_NAME="esci-products"
     else
         INDEX_NAME="my-nlp-index-1"
@@ -131,7 +131,7 @@ else
     echo -e "${YELLOW}⚠ Index does not exist${NC}"
     
     # For ESCI dataset, let the ingestion script handle index creation with proper mapping
-    if [ "$DATASET_NAME" = "esci-product" ]; then
+    if [ "$DATASET_NAME" = "esci-products" ]; then
         echo "Index will be created by ESCI ingestion script with proper O19S-compatible mapping..."
     else
         echo "Creating index with hybrid mappings..."
@@ -154,15 +154,11 @@ else
               },
               "title_embedding": {
                 "type": "knn_vector",
-                "dimension": 384,
+                "dimension": 768,
                 "method": {
                   "name": "hnsw",
                   "space_type": "l2",
-                  "engine": "lucene",
-                  "parameters": {
-                    "ef_construction": 128,
-                    "m": 24
-                  }
+                  "engine": "lucene"
                 }
               },
               "product_title": {
@@ -343,8 +339,8 @@ DOC_COUNT=$(curl -s $HOST:$PORT/$INDEX_NAME/_count 2>/dev/null | grep -o '"count
 
 if [ -z "$DOC_COUNT" ] || [ "$DOC_COUNT" -eq "0" ]; then
     if [ -n "$DATASET_NAME" ]; then
-        # Special handling for esci-product dataset
-        if [ "$DATASET_NAME" = "esci-product" ]; then
+        # Special handling for esci-products dataset
+        if [ "$DATASET_NAME" = "esci-products" ]; then
             echo -e "${MAJOR}Ingesting ESCI product dataset with O19S-compatible US-only filtering...${RESET}"
             echo "Running: python3 dynamic_hybrid/esci_ingestion.py -m $model_id -h $HOST -p $PORT -i $INDEX_NAME"
             
@@ -365,7 +361,7 @@ if [ -z "$DOC_COUNT" ] || [ "$DOC_COUNT" -eq "0" ]; then
             # Check if dataset URL exists
             if [ -z "${DATASET_URLS[$DATASET_NAME]}" ]; then
                 echo -e "${RED}✗ Unknown dataset: $DATASET_NAME${NC}"
-                echo "Supported datasets: ${!DATASET_URLS[@]} esci-product"
+                echo "Supported datasets: ${!DATASET_URLS[@]} esci-products"
                 exit 1
             fi
             

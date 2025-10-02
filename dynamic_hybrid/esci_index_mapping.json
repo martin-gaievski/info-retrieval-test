@@ -1,64 +1,64 @@
 {
   "settings": {
     "index": {
-      "number_of_shards": 1,
+      "number_of_shards": 12,
       "number_of_replicas": 0,
       "knn": true,
       "refresh_interval": "100ms",
       "default_pipeline": "esci-embedding-pipeline"
     },
     "analysis": {
+      "filter": {
+        "english_minimal_stem": {
+          "type": "stemmer",
+          "language": "minimal_english"
+        }
+      },
       "analyzer": {
-        "esci_analyzer": {
+        "english_stemmed": {
+          "type": "custom",
           "tokenizer": "standard",
-          "filter": ["lowercase", "stop"]
+          "filter": ["lowercase", "english_minimal_stem"]
         }
       }
     }
   },
   "mappings": {
     "properties": {
+      "product_id": {
+        "type": "keyword"
+      },
       "product_title": {
         "type": "text",
-        "analyzer": "esci_analyzer",
-        "term_vector": "with_positions_offsets_payloads",
-        "fields": {
-          "keyword": {
-            "type": "keyword",
-            "ignore_above": 256
-          }
-        }
+        "analyzer": "english_stemmed"
+      },
+      "product_description": {
+        "type": "text",
+        "analyzer": "english_stemmed"
+      },
+      "product_bullet_point": {
+        "type": "text",
+        "analyzer": "english_stemmed",
+        "fielddata": true
+      },
+      "product_brand": {
+        "type": "text",
+        "analyzer": "english_stemmed",
+        "fielddata": true
+      },
+      "product_color": {
+        "type": "text",
+        "analyzer": "english_stemmed",
+        "fielddata": true
       },
       "title_embedding": {
         "type": "knn_vector",
-        "dimension": 384,
+        "dimension": 768,
         "method": {
           "name": "hnsw",
           "space_type": "l2",
-          "engine": "lucene",
-          "parameters": {
-            "ef_construction": 128,
-            "m": 24
-          }
+          "engine": "lucene"
         }
-      },
-      "product_id": {"type": "keyword"},
-      "product_brand": {
-        "type": "text", 
-        "analyzer": "esci_analyzer"
-      },
-      "product_color": {
-        "type": "text", 
-        "analyzer": "esci_analyzer"
-      },
-      "product_description": {
-        "type": "text", 
-        "analyzer": "esci_analyzer"
-      },
-      "product_locale": {"type": "keyword"},
-      "product_bullet_points": {
-        "type": "text", 
-        "analyzer": "esci_analyzer"
       }
     }
   }

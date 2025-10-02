@@ -76,8 +76,8 @@ class O19SCorpusAwareTrainer:
     }
     
     # O19S normalization and combination techniques
-    NORMALIZATION_TECHNIQUES = ['min_max', 'l2']
-    COMBINATION_TECHNIQUES = ['arithmetic_mean', 'harmonic_mean', 'geometric_mean']
+    NORMALIZATION_TECHNIQUES = ['l2']
+    COMBINATION_TECHNIQUES = ['arithmetic_mean',]
     
     def __init__(self, 
                  host: str = "localhost",
@@ -88,12 +88,12 @@ class O19SCorpusAwareTrainer:
         """Initialize O19S corpus-aware trainer"""
         
         # Configure for remote connection
-        use_ssl = port == 443 or port == 80
+        port == 80
         self.client = OpenSearch(
             hosts=[{'host': host, 'port': port}],
             http_compress=True,
             http_auth=None,
-            use_ssl=use_ssl,
+            use_ssl=False,
             verify_certs=False,
             ssl_assert_hostname=False,
             ssl_show_warn=False,
