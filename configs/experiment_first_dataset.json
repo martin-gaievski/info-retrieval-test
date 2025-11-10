@@ -1,0 +1,41 @@
+{
+  "name": "first_dataset_experiment",
+  "opensearch": {
+    "host": "localhost",
+    "port": 9200,
+    "use_ssl": false,
+    "verify_certs": false,
+    "timeout": 30
+  },
+  "index": {
+    "name": "ir_experiment_dataset1",
+    "number_of_shards": 1,
+    "number_of_replicas": 0,
+    "knn_enabled": true,
+    "vector_dimension": 768,
+    "vector_method": "hnsw",
+    "vector_space_type": "l2",
+    "default_pipeline": "embedding_pipeline_v1"
+  },
+  "model": {
+    "name": "msmarco-distilbert-base-tas-b",
+    "model_type": "LOCAL_TEXT_EMBEDDING",
+    "model_format": "TORCH_SCRIPT",
+    "model_url": "https://artifacts.opensearch.org/models/ml-models/hugging face/sentence-transformers/msmarco-distilbert-base-tas-b/1.0.2/torch_script/sentence-transformers_msmarco-distilbert-base-tas-b-1.0.2-torch_script.zip",
+    "description": "MS MARCO DistilBERT model for text embeddings",
+    "version": "1.0.2",
+    "deploy_on_create": true
+  },
+  "pipeline": {
+    "name": "embedding_pipeline_v1",
+    "model_id": "AUTO_FILLED",
+    "input_field": "passage_text",
+    "output_field": "passage_embedding",
+    "description": "Pipeline for generating embeddings from text passages"
+  },
+  "reuse_model": false,
+  "reuse_pipeline": false,
+  "skip_index_creation": false,
+  "skip_model_deployment": false,
+  "skip_pipeline_creation": false
+}

@@ -1,0 +1,27 @@
+{
+  "name": "second_dataset_experiment",
+  "opensearch": {
+    "host": "localhost",
+    "port": 9200,
+    "use_ssl": false,
+    "verify_certs": false,
+    "timeout": 30
+  },
+  "index": {
+    "name": "ir_experiment_dataset2",
+    "number_of_shards": 1,
+    "number_of_replicas": 0,
+    "knn_enabled": true,
+    "vector_dimension": 768,
+    "vector_method": "hnsw",
+    "vector_space_type": "l2",
+    "default_pipeline": "embedding_pipeline_v1"
+  },
+  "reuse_model": true,
+  "reuse_model_id": "REPLACE_WITH_MODEL_ID_FROM_FIRST_EXPERIMENT",
+  "reuse_pipeline": true,
+  "reuse_pipeline_name": "embedding_pipeline_v1",
+  "skip_index_creation": false,
+  "skip_model_deployment": true,
+  "skip_pipeline_creation": true
+}
