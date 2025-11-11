@@ -9,9 +9,9 @@ import pathlib, os, getopt, sys
 
 
 def main(argv):
-    opts, args = getopt.getopt(argv, "d:u:h:p:i:m:o:s:q:",
+    opts, args = getopt.getopt(argv, "d:u:h:p:i:m:o:s:q:r:",
                                ["dataset=", "dataset_url=", "os_host=", "os_port=", "os_index=", "os_model_id=",
-                                "operation=", "subset=", "qty="])
+                                "operation=", "subset=", "qty=", "resume_from="])
     dataset = 'nfcorpus' # use nfcorpus by default
     url = ''
     endpoint = ''
@@ -21,6 +21,7 @@ def main(argv):
     operation = 'both' # default value
     subset = None
     qty = sys.maxsize # max number of queries we want to process, everything by default
+    resume_from = 1  # default: start from first document (1-indexed)
     for opt, arg in opts:
         if opt in ("-d", "-dataset"):
             dataset = arg
@@ -40,6 +41,8 @@ def main(argv):
             subset = arg
         elif opt in ("-q", "-qty"):
             qty = int(arg)
+        elif opt in ("-r", "-resume_from"):
+            resume_from = int(arg)
 
     #### Just some code to print debug information to stdout
     logging.basicConfig(format='%(asctime)s - %(message)s',
@@ -66,14 +69,17 @@ def main(argv):
     corpus, queries, qrels = GenericDataLoader(data_folder=data_folder).load(split="test")
 
     if operation in ['ingest', 'both']:
-        ingest_data(corpus, endpoint, index, port)
+        print('endpoint:' + endpoint + '; port:' + port)
+        if resume_from > 1:
+            print(f'Resuming ingestion from document #{resume_from}')
+        ingest_data(corpus, endpoint, index, port, resume_from)
 
     if operation in ['search', 'both']:
         evaluate(corpus, endpoint, index, model_id, port, qrels, queries, qty)
 
 
-def ingest_data(corpus, endpoint, index, port):
-    OpenSearchDataIngestor(endpoint, port).ingest(corpus, index=index)
+def ingest_data(corpus, endpoint, index, port, resume_from=1):
+    OpenSearchDataIngestor(endpoint, port).ingest(corpus, index=index, start_position=resume_from)
 
 
 def evaluate(corpus, endpoint, index, model_id, port, qrels, queries, qty):
@@ -148,7 +154,7 @@ def evaluate(corpus, endpoint, index, model_id, port, qrels, queries, qty):
         ndcg, _map, recall, precision = retriever.evaluate(qrels, formatted_results, k_values)
         '''
 
-        ndcg, _map, recall, precision = retriever.evaluate(qrels, results, k_values)
+        ndcg, _map, recall, precision = retriever.evaluate(qrels, results, k_values, queries=queries)
         print('--- end of results for ' + method)
 
     # method = 'hybrid'

@@ -21,10 +21,36 @@ class OpenSearchDataIngestor:
         self.max_tokens = 512
         self.language = language
 
-    def ingest(self, corpus: Dict[str, Dict[str, str]], index: str):
+    def ingest(self, corpus: Dict[str, Dict[str, str]], index: str, start_position: int = 1):
+        '''
+        Ingest corpus documents into OpenSearch index.
+        
+        Args:
+            corpus: Dictionary of documents to ingest
+            index: OpenSearch index name
+            start_position: Document position to start from (1-indexed, default=1)
+        '''
+        # Convert 1-indexed start_position to 0-indexed
+        start_index = max(0, start_position - 1)
+        
+        # If starting from a position other than the beginning, log it
+        if start_index > 0:
+            print(f"Starting ingestion from document position {start_position} (skipping first {start_index} documents)")
+        
+        # Calculate the starting batch position
+        start_batch = (start_index // self.bulk_size) * self.bulk_size
+        
         '''for i in range(0, 200, self.bulk_size):'''
-        for i in range(0, len(corpus), self.bulk_size):
-            key_list = itertools.islice(corpus.keys(), i, i + self.bulk_size)
+        for i in range(start_batch, len(corpus), self.bulk_size):
+            # Skip documents before start_index within the first batch
+            batch_start = max(i, start_index)
+            batch_end = min(i + self.bulk_size, len(corpus))
+            
+            # If this batch is entirely before start_index, skip it
+            if batch_end <= start_index:
+                continue
+                
+            key_list = itertools.islice(corpus.keys(), batch_start, batch_end)
 
             def get_doc_text(full_string: str):
                 str_as_list = textwrap.wrap(full_string, self.max_tokens, break_long_words=False,
@@ -70,5 +96,7 @@ class OpenSearchDataIngestor:
                 index=index,
                 body=actions)
 
-            if i % 1000 == 0:
-                print("Ingested " + str(i) + " documents")
+            # Adjust progress message to account for skipped documents
+            total_ingested = max(0, i - start_index)
+            if i % 1000 == 0 and i > 0:
+                print(f"Ingested {total_ingested} documents (total processed: {i})")
