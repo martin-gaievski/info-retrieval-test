@@ -9,8 +9,8 @@ import pathlib, os, getopt, sys
 
 
 def main(argv):
-    opts, args = getopt.getopt(argv, "u:h:p:i:m:n:o:l:e:f:",
-                               ["dataset_url=", "os_host=", "os_port=", "os_index=", "os_model_id=", "num_of_runs=", "operation=", "pipelines=", "method=", "subset="])
+    opts, args = getopt.getopt(argv, "u:h:p:i:m:n:o:l:e:f:r:",
+                               ["dataset_url=", "os_host=", "os_port=", "os_index=", "os_model_id=", "num_of_runs=", "operation=", "pipelines=", "method=", "subset=", "resume_from="])
     dataset = 'cqadupstack'
     url = ''
     endpoint = ''
@@ -22,6 +22,7 @@ def main(argv):
     pipelines = 'norm-pipeline'
     mmethod = 'hybrid'
     subset = ''
+    resume_from = 1  # default: start from first document (1-indexed)
     for opt, arg in opts:
         if opt in ("-d", "-dataset"):
             dataset = arg
@@ -45,6 +46,8 @@ def main(argv):
             mmethod = arg
         elif opt in ("-f", "-subset"):
             subset = arg
+        elif opt in ("-r", "-resume_from"):
+            resume_from = int(arg)
 
 
     #### Just some code to print debug information to stdout
@@ -59,44 +62,113 @@ def main(argv):
     out_dir = os.path.join(pathlib.Path(__file__).parent.absolute(), "datasets")
     data_path = util.download_and_unzip(url, out_dir)
 
-    corpus = {}
-    queries = {}
-    qrels = {}
+    # Get list of available subsets
+    available_subsets = [d for d in os.listdir(data_path) 
+                        if os.path.isdir(os.path.join(data_path, d)) and not d.startswith('.')]
+    available_subsets.sort()
+    
+    # Validate subset parameter for ingest operation
+    if operation in ['ingest', 'both']:
+        if not subset:
+            print("ERROR: The -f/--subset parameter is required for ingest operation!")
+            print(f"Available subsets: {', '.join(available_subsets)}")
+            print("Use 'all' to ingest all subsets")
+            sys.exit(1)
+        elif subset != 'all' and subset not in available_subsets:
+            print(f"ERROR: Invalid subset '{subset}'!")
+            print(f"Available subsets: {', '.join(available_subsets)}")
+            print("Use 'all' to ingest all subsets")
+            sys.exit(1)
+    
+    # Determine which subsets to load
+    if subset == 'all':
+        subsets_to_load = available_subsets
+        print(f"Will process ALL {len(subsets_to_load)} subsets: {', '.join(subsets_to_load)}")
+    elif subset:
+        subsets_to_load = [subset]
+        print(f"Will process subset: {subset}")
+    else:
+        # For evaluate operation without subset specified, load all
+        subsets_to_load = available_subsets
+        print(f"Loading all {len(subsets_to_load)} subsets for evaluation")
+    
+    # Load only the required subsets
     mega_corpus = []
     mega_queries = []
     mega_qrels = []
     data_name = []
-    total_len_corp = 0
-    total_len_q = 0
-    total_len_qrels = 0
-    for filename in os.listdir(data_path):
-        f = os.path.join(data_path, filename) + "/"
-        print(f)
-        corpus, queries, qrels = GenericDataLoader(data_folder=f).load(split="test")
-        mega_corpus.append(corpus)
-        mega_qrels.append(qrels)
-        mega_queries.append(queries)
-        data_name.append(filename)
+    
+    for subset_name in subsets_to_load:
+        subset_path = os.path.join(data_path, subset_name) + "/"
+        print(f"Loading subset: {subset_name} from {subset_path}")
+        try:
+            corpus, queries, qrels = GenericDataLoader(data_folder=subset_path).load(split="test")
+            mega_corpus.append(corpus)
+            mega_queries.append(queries)
+            mega_qrels.append(qrels)
+            data_name.append(subset_name)
+            print(f"  - Loaded {len(corpus)} documents from {subset_name}")
+        except Exception as e:
+            print(f"  - ERROR loading {subset_name}: {e}")
+            continue
 
-    #### Provide the data_path where scifact has been downloaded and unzipped
-    #corpus, queries, qrels = GenericDataLoader(data_folder=data_path).load(split="test")
+    if not mega_corpus:
+        print("ERROR: No data was loaded!")
+        sys.exit(1)
 
     if operation == 'ingest' or operation == 'both':
-        ingest_data(mega_corpus, data_name, endpoint, index, port, subset)
+        ingest_data(mega_corpus, data_name, endpoint, index, port, subset, resume_from)
 
     if operation == 'evaluate' or operation == 'both':
-        evaluate(mega_corpus, data_name, endpoint, index, model_id, port, qrels, queries, num_of_runs, pipelines, mmethod, subset)
+        evaluate(mega_corpus, data_name, endpoint, index, model_id, port, mega_qrels, mega_queries, num_of_runs, pipelines, mmethod, subset)
 
 
-def ingest_data(mega_corpus, data_name, endpoint, index, port, subset):
-    for i in range(len(mega_corpus)):
-        # print(i)
-        if data_name[i] == subset:
-            print("Experiment for ", data_name[i], " is running")
-            OpenSearchDataIngestor(endpoint, port).ingest(mega_corpus[i], index=index)
+def ingest_data(mega_corpus, data_name, endpoint, index, port, subset, resume_from=1):
+    # Determine index naming strategy
+    use_separate_indices = "-" in index  # If index contains dash, assume subset-specific naming
+    
+    if subset == 'all':
+        # Ingest all subsets
+        total_ingested = 0
+        for i in range(len(mega_corpus)):
+            # Use subset-specific index name if pattern detected
+            if use_separate_indices:
+                subset_index = f"{index.split('-')[0]}-{data_name[i]}"
+            else:
+                subset_index = index
+                
+            print(f"\n=== Ingesting subset: {data_name[i]} ({i+1}/{len(data_name)}) ===")
+            print(f"    Target index: {subset_index}")
+            print(f"    Documents to ingest: {len(mega_corpus[i])}")
+            
+            if resume_from > 1 and i == 0:
+                print(f"    Resuming from document #{resume_from}")
+                OpenSearchDataIngestor(endpoint, port).ingest(mega_corpus[i], index=subset_index, start_position=resume_from)
+            else:
+                OpenSearchDataIngestor(endpoint, port).ingest(mega_corpus[i], index=subset_index)
+            total_ingested += len(mega_corpus[i])
+            print(f"    Completed {data_name[i]}. Total documents ingested so far: {total_ingested}")
+    else:
+        # Ingest specific subset
+        for i in range(len(mega_corpus)):
+            if data_name[i] == subset:
+                # Use subset-specific index name if pattern detected
+                if use_separate_indices:
+                    subset_index = f"{index.split('-')[0]}-{data_name[i]}"
+                else:
+                    subset_index = index
+                    
+                print(f"\n=== Ingesting subset: {data_name[i]} ===")
+                print(f"    Target index: {subset_index}")
+                print(f"    Documents to ingest: {len(mega_corpus[i])}")
+                
+                if resume_from > 1:
+                    print(f"    Resuming from document #{resume_from}")
+                OpenSearchDataIngestor(endpoint, port).ingest(mega_corpus[i], index=subset_index, start_position=resume_from)
+                break
 
 
-def evaluate(mega_corpus, data_name, endpoint, index, model_id, port, qrels, queries, num_of_runs, pipelines, mmethod, subset):
+def evaluate(mega_corpus, data_name, endpoint, index, model_id, port, mega_qrels, mega_queries, num_of_runs, pipelines, mmethod, subset):
     # This k values are being used for BM25 search
     # bm25_k_values = [1, 3, 5, 10, 100, min(9999, len(corpus))]
     bm25_k_values = [1, 3, 5, 10, 100]
@@ -106,19 +178,31 @@ def evaluate(mega_corpus, data_name, endpoint, index, model_id, port, qrels, que
     k_values = [5, 10, 100]
 
     mm = mmethod.split(',')
+    
+    # Determine index naming strategy
+    use_separate_indices = "-" in index  # If index contains dash, assume subset-specific naming
 
     for i in range(len(mega_corpus)):
         # print(i)
-        if subset != data_name[i]:
+        if subset and subset != 'all' and subset != data_name[i]:
             continue
-        print("Experiment for ", data_name[i], " is running")
+        # Use subset-specific index name if pattern detected
+        if use_separate_indices:
+            subset_index = f"{index.split('-')[0]}-{data_name[i]}"
+        else:
+            subset_index = index
+            
+        print(f"\n=== Evaluating subset: {data_name[i]} ({i+1}/{len(data_name)}) ===")
+        print(f"    Using index: {subset_index}")
         corpus = mega_corpus[i]
+        queries = mega_queries[i]
+        qrels = mega_qrels[i]
 
         if 'bm25' in mm:
             method = 'bm25'
             print('starting search method ' + method)
             os_retrival = RetrievalOpenSearch(endpoint, port,
-                                              index_name=index,
+                                              index_name=subset_index,
                                               model_id=model_id,
                                               search_method=method,
                                               pipeline_name=pipelines.split(',')[0])
@@ -134,7 +218,7 @@ def evaluate(mega_corpus, data_name, endpoint, index, model_id, port, qrels, que
                 for pipeline in pipelines.split(','):
                     print('starting search method ' + method + " for pipeline " + pipeline)
                     os_retrival = RetrievalOpenSearch(endpoint, port,
-                                                      index_name=index,
+                                                      index_name=subset_index,
                                                       model_id=model_id,
                                                       search_method=method,
                                                       pipeline_name=pipeline)
