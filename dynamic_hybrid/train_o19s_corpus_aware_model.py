@@ -133,6 +133,33 @@ class O19SCorpusAwareTrainer:
     
     # O19S Exact Query Feature Functions
     
+    def has_numbers(self, text: str) -> int:
+        """
+        Checks if a string contains any numeric digits.
+        
+        Args:
+            text: The input string.
+        
+        Returns:
+            1 if the string contains numbers, 0 otherwise.
+        """
+        return 1 if any(char.isdigit() for char in text) else 0
+    
+    def has_special_char(self, text: str) -> int:
+        """
+        Checks if a string contains special characters including quotes and apostrophes.
+        Updated to match the export script implementation.
+        
+        Args:
+            text: The input string.
+        
+        Returns:
+            1 if the string contains special characters, 0 otherwise.
+        """
+        # Updated to include quotes and apostrophes as per export script
+        special_chars = '!@#$%^&*()_+-=[]{}|;:,.<>?\'"'
+        return 1 if any(c in text for c in special_chars) else 0
+    
     def has_punctuation_at_end(self, text: str) -> int:
         """
         Checks if a string ends with a punctuation character.
@@ -310,8 +337,8 @@ class O19SCorpusAwareTrainer:
                 
             for weight in weights_to_test:
                 try:
-                    # Extract 18 features using O19S method
-                    features = self._extract_o19s_18_features(query_string, weight)
+                    # Extract 20 features using O19S method with new additions
+                    features = self._extract_o19s_20_features(query_string, weight)
                     
                     # Test all 6 normalization/combination techniques
                     lexical_weight = round(1.0 - weight, 2)
@@ -377,14 +404,16 @@ class O19SCorpusAwareTrainer:
             
         return np.array(X_features), np.array(y_ndcg), np.array(query_ids)
     
-    def _extract_o19s_18_features(self, query: str, weight: float) -> List[float]:
-        """Extract 18 features using O19S exact methodology."""
+    def _extract_o19s_20_features(self, query: str, weight: float) -> List[float]:
+        """Extract 20 features using O19S exact methodology with new additions."""
         
         # Extract query features using O19S exact functions
         query_features = {
             'f_2_query_length': len(query),
-            'f_4_has_special_char': float(any(c in query for c in '!@#$%^&*()_+-=[]{}|;:,.<>?')),
+            'f_3_has_numbers': float(self.has_numbers(query)),  # NEW feature
+            'f_4_has_special_char': float(self.has_special_char(query)),  # Updated to use new function
             'f_5_has_punctuation_at_end': float(self.has_punctuation_at_end(query)),
+            'f_6_unique_terms_ratio': self.unique_terms_ratio(query),  # NEW feature
             'f_7_capital_letters_ratio': self.capital_letters_ratio(query),
             'f_8_stopwords_ratio': self.stopwords_ratio(query)
         }
@@ -392,26 +421,28 @@ class O19SCorpusAwareTrainer:
         # Extract real-time corpus features using O19S method
         corpus_features = self._collect_corpus_features_o19s_method(query)
         
-        # Create 18-feature vector in O19S training order
+        # Create 20-feature vector matching export script order
         feature_vector = [
             weight,  # f_0_neuralness (neural_search_weight)
             query_features['f_2_query_length'],  # query_length
+            query_features['f_3_has_numbers'],  # has_numbers (NEW)
             query_features['f_4_has_special_char'],  # has_special_char
             query_features['f_5_has_punctuation_at_end'],  # has_punctuation_at_end
+            query_features['f_6_unique_terms_ratio'],  # unique_terms_ratio (NEW)
             query_features['f_7_capital_letters_ratio'],  # capital_letters_ratio
             query_features['f_8_stopwords_ratio'],  # stopwords_ratio
-            corpus_features['max_document_frequency'],  # max_document_frequency
-            corpus_features['min_document_frequency'],  # min_document_frequency
-            corpus_features['total_document_frequency'],  # total_document_frequency
-            corpus_features['average_document_frequency'],  # average_document_frequency
-            corpus_features['variance_document_frequency'],  # variance_document_frequency
-            corpus_features['std_dev_document_frequency'],  # std_dev_document_frequency
-            corpus_features['max_inverse_document_frequency'],  # max_inverse_document_frequency
-            corpus_features['min_inverse_document_frequency'],  # min_inverse_document_frequency
-            corpus_features['total_inverse_document_frequency'],  # total_inverse_document_frequency
-            corpus_features['average_inverse_document_frequency'],  # average_inverse_document_frequency
-            corpus_features['variance_inverse_document_frequency'],  # variance_inverse_document_frequency
-            corpus_features['std_dev_inverse_document_frequency']  # std_dev_inverse_document_frequency
+            corpus_features['max_document_frequency'],  # f_14_max_document_frequency
+            corpus_features['min_document_frequency'],  # f_15_min_document_frequency
+            corpus_features['total_document_frequency'],  # f_16_total_document_frequency
+            corpus_features['average_document_frequency'],  # f_17_average_document_frequency
+            corpus_features['variance_document_frequency'],  # f_18_variance_document_frequency
+            corpus_features['std_dev_document_frequency'],  # f_19_std_dev_document_frequency
+            corpus_features['max_inverse_document_frequency'],  # f_20_max_inverse_document_frequency
+            corpus_features['min_inverse_document_frequency'],  # f_21_min_inverse_document_frequency
+            corpus_features['total_inverse_document_frequency'],  # f_22_total_inverse_document_frequency
+            corpus_features['average_inverse_document_frequency'],  # f_23_average_inverse_document_frequency
+            corpus_features['variance_inverse_document_frequency'],  # f_24_variance_inverse_document_frequency
+            corpus_features['std_dev_inverse_document_frequency']  # f_25_std_dev_inverse_document_frequency
         ]
         
         return feature_vector
@@ -546,7 +577,7 @@ class O19SCorpusAwareTrainer:
         Train Ridge regression model using O19S exact methodology.
         
         Args:
-            X_features: Feature matrix (samples x 18 features)
+            X_features: Feature matrix (samples x 20 features)
             y_ndcg: Target NDCG values
             query_ids: Query identifiers for each sample (for query-based splitting)
             alpha: Ridge regularization parameter (O19S uses 10.0)
@@ -564,10 +595,10 @@ class O19SCorpusAwareTrainer:
         logger.info(f"  Test split: {test_size}")
         logger.info(f"  Cross-validation: {use_cross_validation}")
         
-        # Create feature names
+        # Create feature names for 20 features
         feature_names = [
-            'f_0_neuralness', 'f_2_query_length', 'f_4_has_special_char', 
-            'f_5_has_punctuation_at_end', 'f_7_capital_letters_ratio', 'f_8_stopwords_ratio',
+            'f_0_neuralness', 'f_2_query_length', 'f_3_has_numbers', 'f_4_has_special_char', 
+            'f_5_has_punctuation_at_end', 'f_6_unique_terms_ratio', 'f_7_capital_letters_ratio', 'f_8_stopwords_ratio',
             'f_14_max_document_frequency', 'f_15_min_document_frequency', 'f_16_total_document_frequency',
             'f_17_average_document_frequency', 'f_18_variance_document_frequency', 'f_19_std_dev_document_frequency',
             'f_20_max_inverse_document_frequency', 'f_21_min_inverse_document_frequency', 'f_22_total_inverse_document_frequency',
@@ -675,7 +706,7 @@ class O19SCorpusAwareTrainer:
                 original_scale_coef = coef
             else:
                 # Other features were scaled, adjust coefficient to original scale
-                # The scaler only has 17 features (index 0-16), so adjust index
+                # The scaler only has 19 features (index 0-18), so adjust index
                 scaler_idx = i - 1  # Shift index since weight was removed from scaler
                 original_scale_coef = coef / scaler.scale_[scaler_idx] if scaler.scale_[scaler_idx] != 0 else coef
             logger.info(f"  {name}: {original_scale_coef:.6f}")
@@ -705,27 +736,24 @@ class O19SCorpusAwareTrainer:
                 "hybrid": {
                     "queries": [
                         {
+                            "neural": {
+                                "title_embedding": {
+                                    "query_text": query,
+                                    "model_id": self.model_id,
+                                    "k": 200
+                                }
+                            }
+                        },
+                        {
+                            
                             "multi_match": {
                                 "query": query,
                                 "type": "best_fields",
                                 "operator": "and",
                                 "fields": [
-                                    "product_id^100",
-                                    "product_bullet_point^3", 
-                                    "product_color^2",
-                                    "product_brand^5",
-                                    "product_description",
-                                    "product_title^10"
+                                    "product_id^10",
+                                    "product_title"
                                 ]
-                            }
-                        },
-                        {
-                            "neural": {
-                                "title_embedding": {
-                                    "query_text": query,
-                                    "model_id": self.model_id,
-                                    "k": 100
-                                }
                             }
                         }
                     ]
@@ -821,7 +849,7 @@ Examples:
                        help='Path to O19S ratings.csv file')
     parser.add_argument('--sample-size', type=int, default=None,
                        help='Number of training queries to use (default: None = use all)')
-    parser.add_argument('--weights', type=str, default='0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9',
+    parser.add_argument('--weights', type=str, default='0.0,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0',
                        help='Weights to test per query (comma-separated)')
     parser.add_argument('--alpha', type=float, default=10.0,
                        help='Ridge regularization parameter')
@@ -891,7 +919,7 @@ Examples:
     # Save training metadata
     metadata = {
         'training_samples': len(X_features),
-        'features': 18,
+        'features': 20,
         'weights_tested': weights_to_test,
         'alpha': args.alpha,
         'corpus_field': args.corpus_field,
@@ -900,8 +928,8 @@ Examples:
         'normalization_stats': trainer.normalization_stats,
         'total_combinations_tested': trainer.total_combinations_tested,
         'feature_names': [
-            'f_0_neuralness', 'f_2_query_length', 'f_4_has_special_char', 
-            'f_5_has_punctuation_at_end', 'f_7_capital_letters_ratio', 'f_8_stopwords_ratio',
+            'f_0_neuralness', 'f_2_query_length', 'f_3_has_numbers', 'f_4_has_special_char', 
+            'f_5_has_punctuation_at_end', 'f_6_unique_terms_ratio', 'f_7_capital_letters_ratio', 'f_8_stopwords_ratio',
             'f_14_max_document_frequency', 'f_15_min_document_frequency', 'f_16_total_document_frequency',
             'f_17_average_document_frequency', 'f_18_variance_document_frequency', 'f_19_std_dev_document_frequency',
             'f_20_max_inverse_document_frequency', 'f_21_min_inverse_document_frequency', 'f_22_total_inverse_document_frequency',
@@ -920,7 +948,7 @@ Examples:
     logger.info(f"   Model: {model_path}")
     logger.info(f"   Metadata: {metadata_path}")
     logger.info(f"   Training samples: {len(X_features)}")
-    logger.info(f"   Features: 18 (O19S corpus-aware)")
+    logger.info(f"   Features: 20 (O19S corpus-aware with new additions)")
     logger.info(f"   Data collection time: {data_collection_time:.1f}s")
     logger.info(f"   Total combinations tested: {trainer.total_combinations_tested}")
 
