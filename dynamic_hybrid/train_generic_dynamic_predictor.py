@@ -2,6 +2,7 @@
 """
 Generic training script for dynamic weight predictors across different datasets.
 Supports both datasets with single query file (requiring split) and separate train/test files.
+Automatically downloads missing datasets from BEIR repository.
 """
 
 import json
@@ -13,6 +14,8 @@ import requests
 import argparse
 import random
 import os
+import urllib.request
+import zipfile
 from collections import defaultdict
 from opensearchpy import OpenSearch
 from sklearn.model_selection import train_test_split
@@ -228,7 +231,8 @@ def load_dataset_with_split(dataset_path, split_ratio=0.8, random_seed=42):
 def load_dataset_with_separate_files(dataset_path):
     """
     Load dataset that has separate train/test query files.
-    Used for datasets like fiqa.
+    Used for datasets like fiqa and quora.
+    Supports both train.tsv and dev.tsv for training data.
     """
     # Load queries
     queries = {}
@@ -239,11 +243,23 @@ def load_dataset_with_separate_files(dataset_path):
             data = json.loads(line)
             queries[data['_id']] = data['text']
     
-    # Load train ratings
+    # Load train ratings - check for train.tsv first, then dev.tsv
     train_ratings_file = os.path.join(dataset_path, 'qrels', 'train.tsv')
+    dev_ratings_file = os.path.join(dataset_path, 'qrels', 'dev.tsv')
+    
+    # Determine which training file to use
+    if os.path.exists(train_ratings_file):
+        training_file = train_ratings_file
+        print(f"Using train.tsv for training data")
+    elif os.path.exists(dev_ratings_file):
+        training_file = dev_ratings_file
+        print(f"Using dev.tsv for training data (train.tsv not found)")
+    else:
+        raise FileNotFoundError(f"No training data found. Checked for train.tsv and dev.tsv in {os.path.join(dataset_path, 'qrels')}")
+    
     train_ratings = []
     
-    with open(train_ratings_file, 'r', encoding='utf-8') as f:
+    with open(training_file, 'r', encoding='utf-8') as f:
         next(f)  # Skip header
         for line in f:
             parts = line.strip().split('\t')
@@ -385,11 +401,91 @@ def find_optimal_weight(query_text, query_ratings, opensearch_client, binary_rel
     return best_weight, best_ndcg
 
 
+def download_and_extract_dataset(dataset_path, dataset_url):
+    """
+    Download and extract dataset if it doesn't exist.
+    
+    Args:
+        dataset_path: Local path where dataset should be stored
+        dataset_url: URL to download dataset from
+    """
+    print(f"Dataset not found at {dataset_path}")
+    print(f"Downloading from {dataset_url}...")
+    
+    # Create parent directory if it doesn't exist
+    parent_dir = os.path.dirname(dataset_path)
+    if parent_dir and not os.path.exists(parent_dir):
+        os.makedirs(parent_dir)
+    
+    # Download the zip file
+    zip_path = dataset_path + '.zip'
+    try:
+        with tqdm(unit='B', unit_scale=True, desc="Downloading") as t:
+            def download_hook(block_num, block_size, total_size):
+                if total_size > 0:
+                    t.total = total_size
+                t.update(block_size)
+            
+            urllib.request.urlretrieve(dataset_url, zip_path, reporthook=download_hook)
+        
+        print(f"Downloaded to {zip_path}")
+        
+        # Extract the zip file
+        print(f"Extracting dataset...")
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            # Extract to parent directory - the zip should contain the dataset folder
+            zip_ref.extractall(parent_dir)
+        
+        # Remove the zip file after extraction
+        os.remove(zip_path)
+        print(f"Dataset extracted to {dataset_path}")
+        
+        # Verify extraction was successful
+        if not os.path.exists(dataset_path):
+            raise FileNotFoundError(f"Dataset extraction failed. Expected folder not found: {dataset_path}")
+            
+    except Exception as e:
+        # Clean up zip file if download/extraction failed
+        if os.path.exists(zip_path):
+            os.remove(zip_path)
+        raise Exception(f"Failed to download/extract dataset: {str(e)}")
+
+
+def check_dataset_exists(dataset_path):
+    """
+    Check if dataset exists and has required files.
+    
+    Returns:
+        bool: True if dataset exists with required files, False otherwise
+    """
+    if not os.path.exists(dataset_path):
+        return False
+    
+    # Check for essential files
+    queries_file = os.path.join(dataset_path, 'queries.jsonl')
+    qrels_dir = os.path.join(dataset_path, 'qrels')
+    
+    if not os.path.exists(queries_file):
+        return False
+    
+    if not os.path.exists(qrels_dir):
+        return False
+    
+    # Check if qrels directory has any .tsv files
+    tsv_files = [f for f in os.listdir(qrels_dir) if f.endswith('.tsv')]
+    if not tsv_files:
+        return False
+    
+    return True
+
+
 def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='Train generic dynamic weight predictor')
     parser.add_argument('--dataset-path', type=str, required=True,
                         help='Path to dataset folder (e.g., datasets/fiqa)')
+    parser.add_argument('--dataset-url', type=str, default=None,
+                        help='URL to download dataset from if missing (default: BEIR repository URL)')
     parser.add_argument('--opensearch-host', type=str, required=True,
                         help='OpenSearch host')
     parser.add_argument('--opensearch-port', type=int, default=80,
@@ -432,6 +528,22 @@ def main():
     print(f"Generic Dynamic Weight Predictor Training")
     print(f"Dataset: {args.dataset_path}")
     print("="*70)
+    
+    # Check if dataset exists, download if necessary
+    if not check_dataset_exists(args.dataset_path):
+        # Construct default BEIR URL if not provided
+        if args.dataset_url is None:
+            dataset_name = os.path.basename(args.dataset_path.rstrip('/'))
+            args.dataset_url = f"https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/{dataset_name}.zip"
+        
+        # Download and extract dataset
+        download_and_extract_dataset(args.dataset_path, args.dataset_url)
+        
+        # Verify dataset is now available
+        if not check_dataset_exists(args.dataset_path):
+            raise FileNotFoundError(f"Dataset download/extraction failed. Please check the URL or manually download the dataset.")
+    else:
+        print(f"Dataset found at {args.dataset_path}")
     
     # Load dataset based on type
     if args.requires_split:
