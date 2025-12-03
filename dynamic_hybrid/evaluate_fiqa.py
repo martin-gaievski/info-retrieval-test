@@ -1,0 +1,476 @@
+#!/usr/bin/env python3
+"""
+Evaluate the dynamic weight predictor on FiQA test set.
+FiQA has separate train/test sets and binary ratings.
+"""
+
+import json
+import pandas as pd
+import numpy as np
+import pickle
+import string
+import requests
+import argparse
+import random
+from collections import defaultdict
+from opensearchpy import OpenSearch
+from tqdm import tqdm
+import warnings
+warnings.filterwarnings('ignore')
+
+# OpenSearch configuration for FiQA
+OPENSEARCH_HOST = 'opense-clust-CEpYj56iJ4nM-c3649350d257fde2.elb.us-east-1.amazonaws.com'
+OPENSEARCH_PORT = 80
+INDEX_NAME = 'fiqa'
+MODEL_ID = 'vh0g4ZoB6hz8mTHzcrdG'
+
+# Common English stopwords
+STOPWORDS = {
+    'i', 'me', 'my', 'myself', 'we', 'our', 'ours', 'ourselves', 'you', 
+    'your', 'yours', 'yourself', 'yourselves', 'he', 'him', 'his', 'himself',
+    'she', 'her', 'hers', 'herself', 'it', 'its', 'itself', 'they', 'them',
+    'their', 'theirs', 'themselves', 'what', 'which', 'who', 'whom', 'this',
+    'that', 'these', 'those', 'am', 'is', 'are', 'was', 'were', 'be', 'been',
+    'being', 'have', 'has', 'had', 'having', 'do', 'does', 'did', 'doing',
+    'a', 'an', 'the', 'and', 'but', 'if', 'or', 'because', 'as', 'until',
+    'while', 'of', 'at', 'by', 'for', 'with', 'about', 'against', 'between',
+    'into', 'through', 'during', 'before', 'after', 'above', 'below', 'to',
+    'from', 'up', 'down', 'in', 'out', 'on', 'off', 'over', 'under', 'again',
+    'further', 'then', 'once'
+}
+
+
+class FiQAOpenSearchClient:
+    """OpenSearch client for FiQA hybrid search"""
+    
+    def __init__(self):
+        self.client = OpenSearch(
+            hosts=[{'host': OPENSEARCH_HOST, 'port': OPENSEARCH_PORT}],
+            http_compress=True,
+            use_ssl=False,
+            verify_certs=False,
+            ssl_assert_hostname=False,
+            ssl_show_warn=False,
+        )
+        
+        # Verify connection
+        if not self.client.ping():
+            raise Exception(f"Cannot connect to OpenSearch at {OPENSEARCH_HOST}:{OPENSEARCH_PORT}")
+        
+        print(f"Connected to OpenSearch at {OPENSEARCH_HOST}:{OPENSEARCH_PORT}")
+        print(f"Using index: {INDEX_NAME}")
+        print(f"Using model: {MODEL_ID}")
+    
+    def execute_hybrid_search(self, query, neural_weight, size=100):
+        """Execute hybrid search with given neural/lexical weights"""
+        lexical_weight = round(1.0 - neural_weight, 2)
+        
+        url = f"http://{OPENSEARCH_HOST}:{OPENSEARCH_PORT}/{INDEX_NAME}/_search"
+        headers = {'Content-Type': 'application/json'}
+        
+        payload = {
+            "_source": {"excludes": ["text_embedding"]},
+            "query": {
+                "hybrid": {
+                    "queries": [
+                        {
+                            "neural": {
+                                "text_embedding": {
+                                    "query_text": query,
+                                    "model_id": MODEL_ID,
+                                    "k": 100
+                                }
+                            }
+                        },
+                        {
+                            "multi_match": {
+                                "query": query,
+                                "type": "best_fields",
+                                "operator": "and",
+                                "fields": ["title_key^2", "text_key"]
+                            }
+                        }
+                    ]
+                }
+            },
+            "search_pipeline": {
+                "description": "FiQA hybrid search",
+                "phase_results_processors": [
+                    {
+                        "normalization-processor": {
+                            "normalization": {"technique": "l2"},
+                            "combination": {
+                                "technique": "arithmetic_mean",
+                                "parameters": {"weights": [neural_weight, lexical_weight]}
+                            }
+                        }
+                    }
+                ]
+            },
+            "size": size
+        }
+        
+        try:
+            response = requests.post(url, headers=headers, data=json.dumps(payload), timeout=30)
+            response.raise_for_status()
+            result = response.json()
+            doc_ids = [hit['_id'] for hit in result.get('hits', {}).get('hits', [])]
+            return doc_ids
+        except Exception as e:
+            return []
+
+
+def load_fiqa_data(split='test'):
+    """Load FiQA queries and ratings for specified split"""
+    # Load queries
+    queries = {}
+    with open('datasets/fiqa/queries.jsonl', 'r', encoding='utf-8') as f:
+        for line in f:
+            data = json.loads(line)
+            queries[data['_id']] = data['text']
+    
+    # Load ratings (only relevant documents are listed with score 1)
+    ratings_file = f'datasets/fiqa/qrels/{split}.tsv'
+    ratings_data = []
+    
+    with open(ratings_file, 'r', encoding='utf-8') as f:
+        next(f)  # Skip header
+        for line in f:
+            parts = line.strip().split('\t')
+            if len(parts) >= 3:
+                query_id = parts[0]
+                doc_id = parts[1]
+                # Binary ratings: all listed docs are relevant (1)
+                rating = 1
+                
+                ratings_data.append({
+                    'query_id': query_id,
+                    'doc_id': doc_id,
+                    'rating': rating
+                })
+    
+    # Get unique query IDs from ratings
+    query_ids_in_ratings = set(r['query_id'] for r in ratings_data)
+    
+    # Filter queries to only those with ratings
+    filtered_queries = {qid: text for qid, text in queries.items() if qid in query_ids_in_ratings}
+    
+    return filtered_queries, ratings_data
+
+
+def extract_query_features(query):
+    """Extract query-only features from a query string."""
+    features = {}
+    
+    features['query_length'] = len(query)
+    features['has_numbers'] = 1 if any(c.isdigit() for c in query) else 0
+    
+    special_chars = set(string.punctuation) - {' ', '.', ',', '?', '!', '-', "'"}
+    features['has_special_chars'] = 1 if any(c in special_chars for c in query) else 0
+    
+    terms = query.lower().split()
+    features['num_terms'] = len(terms)
+    
+    unique_terms = set(terms)
+    features['unique_terms_ratio'] = len(unique_terms) / len(terms) if terms else 0
+    
+    stopword_count = sum(1 for term in terms if term in STOPWORDS)
+    features['stopword_ratio'] = stopword_count / len(terms) if terms else 0
+    
+    letters = [c for c in query if c.isalpha()]
+    capital_letters = [c for c in letters if c.isupper()]
+    features['capitalization_ratio'] = len(capital_letters) / len(letters) if letters else 0
+    
+    features['has_punctuation'] = 1 if query.rstrip() and query.rstrip()[-1] in string.punctuation else 0
+    
+    return features
+
+
+def compute_ndcg_at_k(ranked_docs, relevance_dict, k=10):
+    """Compute NDCG@k for binary relevance."""
+    if not ranked_docs:
+        return 0.0
+    
+    relevance_scores = []
+    for doc_id in ranked_docs[:k]:
+        # Binary: 1 if relevant, 0 otherwise
+        relevance_scores.append(1 if doc_id in relevance_dict else 0)
+    
+    dcg = 0.0
+    for i, rel in enumerate(relevance_scores):
+        dcg += (2**rel - 1) / np.log2(i + 2)
+    
+    # Ideal: all 1s up to min(k, num_relevant)
+    num_relevant = len(relevance_dict)
+    ideal_scores = [1] * min(k, num_relevant) + [0] * max(0, k - num_relevant)
+    
+    idcg = 0.0
+    for i, rel in enumerate(ideal_scores):
+        idcg += (2**rel - 1) / np.log2(i + 2)
+    
+    return dcg / idcg if idcg > 0 else 0.0
+
+
+def compute_ndcg_at_multiple_k(ranked_docs, relevance_dict, k_values=[1, 10, 100]):
+    """Compute NDCG at multiple k values."""
+    results = {}
+    for k in k_values:
+        results[f'ndcg@{k}'] = compute_ndcg_at_k(ranked_docs, relevance_dict, k)
+    return results
+
+
+def main():
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Evaluate FiQA dynamic weight predictor')
+    parser.add_argument('--sample-size', type=int, default=None,
+                        help='Number of queries to sample for evaluation (default: use all)')
+    parser.add_argument('--seed', type=int, default=42,
+                        help='Random seed for sampling (default: 42)')
+    args = parser.parse_args()
+    
+    print("="*70)
+    print("FiQA Dynamic Weight Predictor Evaluation")
+    print("="*70)
+    
+    # Load model
+    print("\nLoading model...")
+    with open('dynamic_hybrid/fiqa_model.pkl', 'rb') as f:
+        model_data = pickle.load(f)
+    
+    model = model_data['model']
+    scaler = model_data['scaler']
+    feature_columns = model_data['feature_columns']
+    
+    # Load model metadata
+    with open('dynamic_hybrid/fiqa_model_metadata.json', 'r') as f:
+        metadata = json.load(f)
+    
+    print(f"Model trained on {metadata['train_size']} queries")
+    print(f"Model alpha: {metadata['best_alpha']}")
+    
+    # Initialize OpenSearch client
+    opensearch_client = FiQAOpenSearchClient()
+    
+    # Load test data
+    print("\nLoading FiQA test data...")
+    test_queries, test_ratings = load_fiqa_data('test')
+    print(f"Loaded {len(test_queries)} test queries")
+    print(f"Loaded {len(test_ratings)} test ratings")
+    
+    # Sample queries if requested
+    if args.sample_size and args.sample_size < len(test_queries):
+        print(f"\nSampling {args.sample_size} queries from {len(test_queries)} total...")
+        random.seed(args.seed)
+        sampled_ids = random.sample(list(test_queries.keys()), args.sample_size)
+        test_queries = {qid: test_queries[qid] for qid in sampled_ids}
+        print(f"Using {len(test_queries)} sampled queries for evaluation")
+    
+    # Group ratings by query (binary relevance)
+    query_ratings = defaultdict(set)
+    for rating in test_ratings:
+        query_ratings[rating['query_id']].add(rating['doc_id'])
+    
+    # Define k values for evaluation
+    k_values = [1, 10, 100]
+    print(f"\nWill evaluate at k values: {k_values}")
+    
+    # 1. Evaluate static weights on test set
+    print("\n" + "="*70)
+    print("1. EVALUATING STATIC WEIGHTS ON TEST SET")
+    print("="*70)
+    
+    print("\nTesting different weight combinations...")
+    static_results_by_k = {k: {} for k in k_values}
+    
+    weight_steps = list(np.arange(0.0, 1.1, 0.1))
+    for neural_weight in tqdm(weight_steps, desc="Testing weights"):
+        neural_weight = round(neural_weight, 1)
+        lexical_weight = round(1.0 - neural_weight, 1)
+        
+        # Accumulate NDCG for each k
+        total_ndcg_by_k = {k: 0.0 for k in k_values}
+        query_count = 0
+        
+        for query_id, query_text in test_queries.items():
+            if query_id not in query_ratings:
+                continue
+            
+            relevant_docs = query_ratings[query_id]
+            ranked_docs = opensearch_client.execute_hybrid_search(query_text, neural_weight)
+            ndcg_scores = compute_ndcg_at_multiple_k(ranked_docs, relevant_docs, k_values)
+            
+            for k in k_values:
+                total_ndcg_by_k[k] += ndcg_scores[f'ndcg@{k}']
+            query_count += 1
+        
+        # Store average NDCG for each k
+        for k in k_values:
+            avg_ndcg = total_ndcg_by_k[k] / query_count if query_count > 0 else 0.0
+            static_results_by_k[k][lexical_weight] = avg_ndcg
+    
+    # Display results for each k
+    print("\nStatic Weight Results (Test Set):")
+    for k in k_values:
+        print(f"\n--- NDCG@{k} ---")
+        print("-" * 40)
+        for weight, ndcg in sorted(static_results_by_k[k].items()):
+            print(f"Lexical {weight:.1f}: NDCG@{k} = {ndcg:.4f}")
+        
+        best_weight = max(static_results_by_k[k], key=static_results_by_k[k].get)
+        best_ndcg = static_results_by_k[k][best_weight]
+        print(f"Best for NDCG@{k}: Lexical {best_weight:.1f} = {best_ndcg:.4f}")
+    
+    # Use NDCG@10 as primary metric
+    static_results = static_results_by_k[10]
+    best_static_weight = max(static_results, key=static_results.get)
+    best_static_ndcg = static_results[best_static_weight]
+    
+    # 2. Evaluate dynamic model on test set
+    print("\n" + "="*70)
+    print("2. EVALUATING DYNAMIC MODEL ON TEST SET")
+    print("="*70)
+    
+    print("\nEvaluating dynamic weight predictions...")
+    query_results = []
+    total_dynamic_ndcg_by_k = {k: 0.0 for k in k_values}
+    
+    for query_id, query_text in tqdm(sorted(test_queries.items()), desc="Processing queries"):
+        if query_id not in query_ratings:
+            continue
+        
+        # Extract features
+        features = extract_query_features(query_text)
+        X = pd.DataFrame([features])[feature_columns]
+        X_scaled = scaler.transform(X)
+        
+        # Predict weight
+        predicted_weight_raw = model.predict(X_scaled)[0]
+        predicted_weight = round(np.clip(predicted_weight_raw, 0, 1) * 10) / 10
+        
+        # Find actual optimal weight for this query (for NDCG@10)
+        relevant_docs = query_ratings[query_id]
+        
+        best_weight = 0.0
+        best_ndcg = 0.0
+        for neural_weight in np.arange(0.0, 1.1, 0.1):
+            neural_weight = round(neural_weight, 1)
+            ranked_docs = opensearch_client.execute_hybrid_search(query_text, neural_weight)
+            ndcg = compute_ndcg_at_k(ranked_docs, relevant_docs, k=10)
+            lexical_weight = round(1.0 - neural_weight, 1)
+            if ndcg >= best_ndcg:
+                best_ndcg = ndcg
+                best_weight = lexical_weight
+        
+        # Evaluate with predicted weight at multiple k values
+        neural_weight = round(1.0 - predicted_weight, 1)
+        ranked_docs = opensearch_client.execute_hybrid_search(query_text, neural_weight)
+        ndcg_scores = compute_ndcg_at_multiple_k(ranked_docs, relevant_docs, k_values)
+        
+        # Accumulate NDCG for each k
+        for k in k_values:
+            total_dynamic_ndcg_by_k[k] += ndcg_scores[f'ndcg@{k}']
+        
+        query_results.append({
+            'query_id': query_id,
+            'query_text': query_text[:50] + '...' if len(query_text) > 50 else query_text,
+            'optimal_weight': best_weight,
+            'predicted_weight': predicted_weight,
+            'optimal_ndcg': best_ndcg,
+            'dynamic_ndcg': ndcg_scores['ndcg@10'],
+            'difference': abs(best_weight - predicted_weight)
+        })
+    
+    # Calculate average NDCG for each k
+    avg_dynamic_ndcg_by_k = {}
+    for k in k_values:
+        avg_dynamic_ndcg_by_k[k] = total_dynamic_ndcg_by_k[k] / len(query_results) if query_results else 0.0
+    
+    # Use NDCG@10 as primary metric
+    avg_dynamic_ndcg = avg_dynamic_ndcg_by_k[10]
+    
+    # Display dynamic model results
+    print("\nDynamic Model Results:")
+    print("-" * 40)
+    for k in k_values:
+        print(f"Dynamic Model NDCG@{k}: {avg_dynamic_ndcg_by_k[k]:.4f}")
+    
+    # 3. Summary
+    print("\n" + "="*70)
+    print("EVALUATION SUMMARY")
+    print("="*70)
+    
+    print(f"\nTraining Set Size: {metadata['train_size']} queries")
+    print(f"Test Set Size: {len(test_queries)} queries")
+    
+    # Show comparison for each k value
+    print("\n" + "="*70)
+    print("PERFORMANCE COMPARISON AT DIFFERENT K VALUES")
+    print("="*70)
+    
+    for k in k_values:
+        best_static_k = max(static_results_by_k[k], key=static_results_by_k[k].get)
+        best_static_ndcg_k = static_results_by_k[k][best_static_k]
+        dynamic_ndcg_k = avg_dynamic_ndcg_by_k[k]
+        improvement_k = ((dynamic_ndcg_k - best_static_ndcg_k) / best_static_ndcg_k) * 100 if best_static_ndcg_k > 0 else 0
+        
+        print(f"\n--- NDCG@{k} ---")
+        print(f"Best Static Weight: Lexical {best_static_k:.1f}")
+        print(f"Best Static NDCG@{k}: {best_static_ndcg_k:.4f}")
+        print(f"Dynamic Model NDCG@{k}: {dynamic_ndcg_k:.4f}")
+        print(f"Improvement: {improvement_k:+.2f}%")
+    
+    # Primary metric (NDCG@10) summary
+    print("\n" + "="*70)
+    print("PRIMARY METRIC (NDCG@10)")
+    print("="*70)
+    
+    print(f"\nBest Static Weight: Lexical {best_static_weight:.1f}")
+    print(f"Best Static NDCG@10: {best_static_ndcg:.4f}")
+    print(f"\nDynamic Model NDCG@10: {avg_dynamic_ndcg:.4f}")
+    
+    improvement = ((avg_dynamic_ndcg - best_static_ndcg) / best_static_ndcg) * 100 if best_static_ndcg > 0 else 0
+    print(f"Improvement over best static: {improvement:+.2f}%")
+    
+    # Save results
+    results = {
+        'train_queries': metadata['train_size'],
+        'test_queries': len(test_queries),
+        'static_results': {f'{k:.1f}': float(v) for k, v in static_results.items()},
+        'static_results_by_k': {
+            k: {f'{w:.1f}': float(v) for w, v in static_results_by_k[k].items()}
+            for k in k_values
+        },
+        'best_static_weight': float(best_static_weight),
+        'best_static_ndcg': float(best_static_ndcg),
+        'dynamic_ndcg': float(avg_dynamic_ndcg),
+        'dynamic_ndcg_by_k': {k: float(v) for k, v in avg_dynamic_ndcg_by_k.items()},
+        'improvement_percent': float(improvement),
+        'per_query_results': query_results[:10],  # Save first 10 for brevity
+        'model': {
+            'alpha': metadata['best_alpha'],
+            'features': feature_columns
+        }
+    }
+    
+    with open('dynamic_hybrid/fiqa_evaluation.json', 'w') as f:
+        json.dump(results, f, indent=2)
+    
+    print(f"\nResults saved to dynamic_hybrid/fiqa_evaluation.json")
+    
+    # Display prediction distribution
+    print("\n" + "="*70)
+    print("PREDICTION ANALYSIS")
+    print("="*70)
+    
+    prediction_df = pd.DataFrame(query_results)
+    print("\nPredicted Weight Distribution:")
+    print(prediction_df['predicted_weight'].value_counts().sort_index())
+    
+    print("\nOptimal Weight Distribution:")
+    print(prediction_df['optimal_weight'].value_counts().sort_index())
+    
+    print("\nMean Absolute Error: {:.2f}".format(prediction_df['difference'].mean()))
+
+
+if __name__ == "__main__":
+    main()
