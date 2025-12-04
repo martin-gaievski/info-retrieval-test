@@ -1,24 +1,24 @@
 #!/usr/bin/env python3
 """
-Generic training script for dynamic weight predictors across different datasets.
-Supports both datasets with single query file (requiring split) and separate train/test files.
-Automatically downloads missing datasets from BEIR repository.
+Neural network training script for dynamic weight predictors.
+Uses a 3-layer MLP with ReLU activations and sigmoid output to predict lexical weights.
 """
 
 import json
 import pandas as pd
 import numpy as np
-import pickle
-import requests
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
 import argparse
 import random
 import os
+import requests  # For OpenSearch client
 from collections import defaultdict
-from opensearchpy import OpenSearch
-from tqdm import tqdm
+from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import RidgeCV
-from sklearn.metrics import mean_squared_error
+from tqdm import tqdm
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -42,6 +42,61 @@ from utils.output_formatter import (
     create_metadata,
     format_training_summary
 )
+
+from opensearchpy import OpenSearch  # For legacy OpenSearch client
+
+# Set random seeds for reproducibility
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+# Common English stopwords
+STOPWORDS = {
+    'i', 'me', 'my', 'myself', 'we', 'our', 'ours', 'ourselves', 'you', 
+    'your', 'yours', 'yourself', 'yourselves', 'he', 'him', 'his', 'himself',
+    'she', 'her', 'hers', 'herself', 'it', 'its', 'itself', 'they', 'them',
+    'their', 'theirs', 'themselves', 'what', 'which', 'who', 'whom', 'this',
+    'that', 'these', 'those', 'am', 'is', 'are', 'was', 'were', 'be', 'been',
+    'being', 'have', 'has', 'had', 'having', 'do', 'does', 'did', 'doing',
+    'a', 'an', 'the', 'and', 'but', 'if', 'or', 'because', 'as', 'until',
+    'while', 'of', 'at', 'by', 'for', 'with', 'about', 'against', 'between',
+    'into', 'through', 'during', 'before', 'after', 'above', 'below', 'to',
+    'from', 'up', 'down', 'in', 'out', 'on', 'off', 'over', 'under', 'again',
+    'further', 'then', 'once'
+}
+
+
+class WeightPredictorNetwork(nn.Module):
+    """3-layer MLP for predicting lexical weight from query features."""
+    
+    def __init__(self, input_dim):
+        super(WeightPredictorNetwork, self).__init__()
+        self.layer1 = nn.Linear(input_dim, 150)
+        self.layer2 = nn.Linear(150, 100)
+        self.layer3 = nn.Linear(100, 50)
+        self.output = nn.Linear(50, 1)
+        self.relu = nn.ReLU()
+        self.sigmoid = nn.Sigmoid()
+        
+        # Initialize weights
+        self._initialize_weights()
+    
+    def _initialize_weights(self):
+        """Initialize network weights using Xavier initialization."""
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+    
+    def forward(self, x):
+        x = self.relu(self.layer1(x))
+        x = self.relu(self.layer2(x))
+        x = self.relu(self.layer3(x))
+        x = self.sigmoid(self.output(x))
+        return x
 
 
 class GenericOpenSearchClient:
@@ -174,10 +229,8 @@ class GenericOpenSearchClient:
 def find_optimal_weight(query_text, query_ratings, opensearch_client, binary_relevance=False):
     """Find the optimal weight for a query that maximizes NDCG@10"""
     if binary_relevance:
-        # For binary relevance, convert to set
         relevant_docs = set(r['doc_id'] for r in query_ratings)
     else:
-        # For graded relevance, create dict
         relevant_docs = {r['doc_id']: r['rating'] for r in query_ratings}
     
     best_weight = 0.0
@@ -205,7 +258,7 @@ def find_optimal_weight(query_text, query_ratings, opensearch_client, binary_rel
 
 def main():
     # Parse command line arguments
-    parser = argparse.ArgumentParser(description='Train generic dynamic weight predictor')
+    parser = argparse.ArgumentParser(description='Train neural network dynamic weight predictor')
     parser.add_argument('--dataset-path', type=str, required=True,
                         help='Path to dataset folder (e.g., datasets/fiqa)')
     parser.add_argument('--dataset-url', type=str, default=None,
@@ -222,50 +275,60 @@ def main():
                         help='Neural field name (default: passage_embedding)')
     parser.add_argument('--lexical-fields', type=str, nargs='+', 
                         default=['title_key^2', 'text_key'],
-                        help='Lexical field names with optional boost (default: title_key^2 text_key)')
+                        help='Lexical field names with optional boost')
     parser.add_argument('--requires-split', action='store_true',
-                        help='Dataset requires train/test split (like trec-covid, nq)')
+                        help='Dataset requires train/test split')
     parser.add_argument('--split-ratio', type=float, default=0.8,
                         help='Train split ratio if requires-split is true (default: 0.8)')
     parser.add_argument('--binary-relevance', action='store_true',
-                        help='Use binary relevance (all relevant docs have score 1)')
+                        help='Use binary relevance')
     parser.add_argument('--sample-size', type=int, default=None,
-                        help='Number of queries to sample for training (default: use all)')
+                        help='Number of queries to sample for training')
     parser.add_argument('--seed', type=int, default=42,
-                        help='Random seed for sampling and splitting (default: 42)')
+                        help='Random seed for reproducibility (default: 42)')
     parser.add_argument('--model-name', type=str, default=None,
-                        help='Name for the model files (default: {dataset}_model)')
+                        help='Name for the model files (default: {dataset}_neural_model)')
     parser.add_argument('--normalization', type=str, default='l2',
                         choices=['l2', 'min_max'],
                         help='Normalization technique for hybrid search (default: l2)')
     parser.add_argument('--combination', type=str, default='arithmetic_mean',
                         choices=['arithmetic_mean', 'geometric_mean', 'harmonic_mean'],
                         help='Combination technique for hybrid search (default: arithmetic_mean)')
+    parser.add_argument('--epochs', type=int, default=100,
+                        help='Number of training epochs (default: 100)')
+    parser.add_argument('--batch-size', type=int, default=32,
+                        help='Batch size for training (default: 32)')
+    parser.add_argument('--learning-rate', type=float, default=0.001,
+                        help='Learning rate for optimizer (default: 0.001)')
+    parser.add_argument('--validation-split', type=float, default=0.2,
+                        help='Validation split from training data (default: 0.2)')
+    parser.add_argument('--early-stopping-patience', type=int, default=10,
+                        help='Early stopping patience (default: 10)')
     args = parser.parse_args()
+    
+    # Set random seed
+    set_seed(args.seed)
     
     # Set default model name based on dataset
     if args.model_name is None:
         dataset_name = os.path.basename(args.dataset_path.rstrip('/'))
-        args.model_name = f"{dataset_name}_model"
+        args.model_name = f"{dataset_name}_neural_model"
     
     print("="*70)
-    print(f"Generic Dynamic Weight Predictor Training")
+    print(f"Neural Network Dynamic Weight Predictor Training")
     print(f"Dataset: {args.dataset_path}")
     print("="*70)
     
     # Check if dataset exists, download if necessary
     if not check_dataset_exists(args.dataset_path):
-        # Construct default BEIR URL if not provided
         if args.dataset_url is None:
             dataset_name = os.path.basename(args.dataset_path.rstrip('/'))
             args.dataset_url = f"https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/{dataset_name}.zip"
         
-        # Download and extract dataset
         download_and_extract_dataset(args.dataset_path, args.dataset_url)
         
-        # Verify dataset is now available
         if not check_dataset_exists(args.dataset_path):
-            raise FileNotFoundError(f"Dataset download/extraction failed. Please check the URL or manually download the dataset.")
+            raise FileNotFoundError(f"Dataset download/extraction failed.")
     else:
         print(f"Dataset found at {args.dataset_path}")
     
@@ -339,41 +402,23 @@ def main():
     
     # Display distribution of optimal weights
     print("\n" + "="*70)
-    print("OPTIMAL WEIGHT DISTRIBUTION (training set only)")
+    print("OPTIMAL WEIGHT DISTRIBUTION")
     print("="*70)
-    print("optimal_weight")
     weight_distribution = training_df['optimal_weight'].value_counts()
     print(weight_distribution.sort_index())
     
-    # Check for diversity in optimal weights
-    print("\n" + "="*70)
-    print("DIVERSITY CHECK")
-    print("="*70)
-    
-    # Calculate diversity metrics
+    # Check for diversity
     unique_weights = len(weight_distribution)
     most_common_weight = weight_distribution.iloc[0]
     most_common_percentage = (most_common_weight / len(training_df)) * 100
     
-    print(f"Unique weight values: {unique_weights}")
+    print(f"\nUnique weight values: {unique_weights}")
     print(f"Most common weight frequency: {most_common_percentage:.1f}%")
     
-    # Warning if distribution is too skewed
     if most_common_percentage > 80:
         print("\n⚠️  WARNING: Weight distribution is highly skewed!")
         print(f"   {most_common_percentage:.1f}% of queries have the same optimal weight.")
-        print("   This may result in a model that cannot learn meaningful patterns.")
-        print("\n   Consider:")
-        print("   1. Increasing sample size to capture more diversity")
-        print("   2. Using stratified sampling")
-        print("   3. Trying different normalization/combination methods")
-        print("   4. Using a fixed weight for this dataset")
-    elif most_common_percentage > 60:
-        print("\n⚠️  CAUTION: Weight distribution is moderately skewed.")
-        print(f"   {most_common_percentage:.1f}% of queries have the same optimal weight.")
-        print("   Model performance may be limited.")
-    else:
-        print("\n✓ Weight distribution shows good diversity for training.")
+        print("   Neural network may struggle to learn meaningful patterns.")
     
     # Prepare features and targets
     feature_columns = [
@@ -382,64 +427,176 @@ def main():
     ]
     
     X = training_df[feature_columns].values
-    y = training_df['optimal_weight'].values
-    
-    # Train model
-    print("\n" + "="*70)
-    print("TRAINING RIDGE REGRESSION MODEL")
-    print("="*70)
-    print("\nTraining Ridge regression model...")
+    y = training_df['optimal_weight'].values.reshape(-1, 1)
     
     # Standardize features
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
     
-    # Train Ridge regression with cross-validation
-    alphas = [0.001, 0.01, 0.1, 1.0, 10.0, 100.0, 1000.0]
-    model = RidgeCV(alphas=alphas, cv=5)
-    model.fit(X_scaled, y)
+    # Split into train and validation
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_scaled, y, test_size=args.validation_split, random_state=args.seed
+    )
     
-    # Calculate training metrics
-    y_pred = model.predict(X_scaled)
-    train_mse = mean_squared_error(y, y_pred)
-    train_r2 = model.score(X_scaled, y)
+    # Convert to PyTorch tensors
+    X_train_tensor = torch.FloatTensor(X_train)
+    y_train_tensor = torch.FloatTensor(y_train)
+    X_val_tensor = torch.FloatTensor(X_val)
+    y_val_tensor = torch.FloatTensor(y_val)
     
-    print("\nTraining Results:")
-    print(f"Best alpha: {model.alpha_}")
-    print(f"Training MSE: {train_mse:.4f}")
-    print(f"Training R²: {train_r2:.4f}")
+    # Create DataLoaders
+    train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
     
-    # Display feature importance
-    print("\nFeature Importance (sorted by absolute coefficient):")
-    feature_importance = pd.DataFrame({
-        'feature': feature_columns,
-        'coefficient': model.coef_
-    })
-    feature_importance['abs_coef'] = np.abs(feature_importance['coefficient'])
-    feature_importance = feature_importance.sort_values('abs_coef', ascending=False)
-    feature_importance = feature_importance[['feature', 'coefficient']]
+    val_dataset = TensorDataset(X_val_tensor, y_val_tensor)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
     
-    print(feature_importance.to_string(index=False, float_format=lambda x: f'{x:12.6f}'))
+    # Initialize model
+    print("\n" + "="*70)
+    print("TRAINING NEURAL NETWORK")
+    print("="*70)
     
-    # Save model and metadata
-    model_data = {
-        'model': model,
-        'scaler': scaler,
-        'feature_columns': feature_columns,
-        'normalization': args.normalization,
-        'combination': args.combination,
-        'dataset_config': {
-            'dataset_path': args.dataset_path,
-            'requires_split': args.requires_split,
-            'binary_relevance': args.binary_relevance,
-            'neural_field': args.neural_field,
-            'lexical_fields': args.lexical_fields
-        }
+    input_dim = len(feature_columns)
+    model = WeightPredictorNetwork(input_dim)
+    
+    # Loss function and optimizer
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
+    
+    # Training loop with early stopping
+    best_val_loss = float('inf')
+    patience_counter = 0
+    training_history = {
+        'train_loss': [],
+        'val_loss': [],
+        'train_mae': [],
+        'val_mae': []
     }
     
-    model_path = f'dynamic_hybrid/{args.model_name}.pkl'
-    with open(model_path, 'wb') as f:
-        pickle.dump(model_data, f)
+    print(f"\nTraining for up to {args.epochs} epochs")
+    print(f"Batch size: {args.batch_size}")
+    print(f"Learning rate: {args.learning_rate}")
+    print(f"Early stopping patience: {args.early_stopping_patience}")
+    print(f"Training samples: {len(X_train)}")
+    print(f"Validation samples: {len(X_val)}")
+    
+    for epoch in range(args.epochs):
+        # Training phase
+        model.train()
+        train_loss = 0.0
+        train_mae = 0.0
+        
+        for batch_features, batch_targets in train_loader:
+            optimizer.zero_grad()
+            predictions = model(batch_features)
+            loss = criterion(predictions, batch_targets)
+            loss.backward()
+            optimizer.step()
+            
+            train_loss += loss.item() * batch_features.size(0)
+            train_mae += torch.mean(torch.abs(predictions - batch_targets)).item() * batch_features.size(0)
+        
+        train_loss /= len(train_loader.dataset)
+        train_mae /= len(train_loader.dataset)
+        
+        # Validation phase
+        model.eval()
+        val_loss = 0.0
+        val_mae = 0.0
+        
+        with torch.no_grad():
+            for batch_features, batch_targets in val_loader:
+                predictions = model(batch_features)
+                loss = criterion(predictions, batch_targets)
+                
+                val_loss += loss.item() * batch_features.size(0)
+                val_mae += torch.mean(torch.abs(predictions - batch_targets)).item() * batch_features.size(0)
+        
+        val_loss /= len(val_loader.dataset)
+        val_mae /= len(val_loader.dataset)
+        
+        # Store history
+        training_history['train_loss'].append(train_loss)
+        training_history['val_loss'].append(val_loss)
+        training_history['train_mae'].append(train_mae)
+        training_history['val_mae'].append(val_mae)
+        
+        # Print progress
+        if (epoch + 1) % 10 == 0 or epoch == 0:
+            print(f"Epoch [{epoch+1}/{args.epochs}] - "
+                  f"Train Loss: {train_loss:.4f}, Train MAE: {train_mae:.4f} - "
+                  f"Val Loss: {val_loss:.4f}, Val MAE: {val_mae:.4f}")
+        
+        # Early stopping
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+            # Save best model
+            best_model_state = model.state_dict()
+        else:
+            patience_counter += 1
+            if patience_counter >= args.early_stopping_patience:
+                print(f"\nEarly stopping triggered after {epoch+1} epochs")
+                break
+    
+    # Load best model
+    model.load_state_dict(best_model_state)
+    
+    # Final evaluation on full training set
+    model.eval()
+    with torch.no_grad():
+        X_train_full = torch.FloatTensor(X_scaled)
+        y_train_full = torch.FloatTensor(training_df['optimal_weight'].values.reshape(-1, 1))
+        predictions_full = model(X_train_full)
+        
+        final_mse = criterion(predictions_full, y_train_full).item()
+        final_mae = torch.mean(torch.abs(predictions_full - y_train_full)).item()
+        
+        # Calculate R²
+        ss_res = torch.sum((y_train_full - predictions_full) ** 2)
+        ss_tot = torch.sum((y_train_full - torch.mean(y_train_full)) ** 2)
+        r2_score = 1 - (ss_res / ss_tot).item()
+    
+    print("\n" + "="*70)
+    print("TRAINING RESULTS")
+    print("="*70)
+    print(f"Final MSE: {final_mse:.4f}")
+    print(f"Final MAE: {final_mae:.4f}")
+    print(f"Final R²: {r2_score:.4f}")
+    print(f"Best Validation Loss: {best_val_loss:.4f}")
+    
+    # Analyze predictions
+    predictions_np = predictions_full.numpy()
+    print(f"\nPrediction Range: [{predictions_np.min():.3f}, {predictions_np.max():.3f}]")
+    print(f"Prediction Mean: {predictions_np.mean():.3f}")
+    print(f"Prediction Std: {predictions_np.std():.3f}")
+    
+    # Save model and metadata
+    print("\n" + "="*70)
+    print("SAVING MODEL")
+    print("="*70)
+    
+    # Create directory if it doesn't exist
+    os.makedirs('dynamic_hybrid', exist_ok=True)
+    
+    # Save PyTorch model
+    model_path = f'dynamic_hybrid/{args.model_name}.pth'
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'model_architecture': {
+            'input_dim': input_dim,
+            'layer_sizes': [150, 100, 50, 1]
+        },
+        'scaler': scaler,
+        'feature_columns': feature_columns,
+        'training_history': training_history,
+        'final_metrics': {
+            'mse': final_mse,
+            'mae': final_mae,
+            'r2': r2_score
+        },
+        'training_args': vars(args)
+    }, model_path)
     
     # Save metadata
     metadata = {
@@ -447,8 +604,16 @@ def main():
         'dataset_path': args.dataset_path,
         'train_size': len(training_df),
         'test_size': len(test_queries),
-        'best_alpha': float(model.alpha_),
-        'r2_score': float(model.score(X_scaled, y)),
+        'validation_size': len(X_val),
+        'model_type': 'neural_network',
+        'architecture': '3-layer MLP (150-100-50-1)',
+        'activation': 'ReLU',
+        'output_activation': 'Sigmoid',
+        'final_mse': float(final_mse),
+        'final_mae': float(final_mae),
+        'r2_score': float(r2_score),
+        'best_val_loss': float(best_val_loss),
+        'epochs_trained': len(training_history['train_loss']),
         'feature_columns': feature_columns,
         'normalization': args.normalization,
         'combination': args.combination,
@@ -461,6 +626,13 @@ def main():
             'model_id': args.model_id,
             'neural_field': args.neural_field,
             'lexical_fields': args.lexical_fields
+        },
+        'training_params': {
+            'batch_size': args.batch_size,
+            'learning_rate': args.learning_rate,
+            'epochs': args.epochs,
+            'early_stopping_patience': args.early_stopping_patience,
+            'validation_split': args.validation_split
         }
     }
     
@@ -472,14 +644,37 @@ def main():
     training_data_path = f'dynamic_hybrid/{args.model_name}_training_data.csv'
     training_df.to_csv(training_data_path, index=False)
     
-    print("\n" + "="*70)
-    print("TRAINING COMPLETE")
-    print("="*70)
     print(f"✓ Model saved to {model_path}")
     print(f"✓ Metadata saved to {metadata_path}")
     print(f"✓ Training data saved to {training_data_path}")
     print(f"✓ Trained on {len(training_df)} queries")
     print(f"✓ Test set has {len(test_queries)} queries for evaluation")
+    
+    # Display weight distribution analysis
+    print("\n" + "="*70)
+    print("WEIGHT DISTRIBUTION ANALYSIS")
+    print("="*70)
+    
+    # Compare actual vs predicted weights on training set
+    actual_weights = training_df['optimal_weight'].values
+    predicted_weights = predictions_np.flatten()
+    
+    # Round predictions to nearest 0.1 for comparison
+    predicted_weights_rounded = np.round(predicted_weights * 10) / 10
+    
+    print("\nActual Weight Distribution:")
+    unique, counts = np.unique(actual_weights, return_counts=True)
+    for w, c in zip(unique, counts):
+        print(f"  {w:.1f}: {c} ({c/len(actual_weights)*100:.1f}%)")
+    
+    print("\nPredicted Weight Distribution (rounded to 0.1):")
+    unique, counts = np.unique(predicted_weights_rounded, return_counts=True)
+    for w, c in zip(unique, counts):
+        print(f"  {w:.1f}: {c} ({c/len(predicted_weights_rounded)*100:.1f}%)")
+    
+    print("\n" + "="*70)
+    print("TRAINING COMPLETE")
+    print("="*70)
 
 
 if __name__ == "__main__":
