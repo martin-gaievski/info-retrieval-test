@@ -362,16 +362,21 @@ def main():
                         help='Lexical field names with optional boost')
     parser.add_argument('--binary-relevance', action='store_true',
                         help='Use binary relevance (for --static-only)')
-    parser.add_argument('--normalization', type=str, default='l2',
+    parser.add_argument('--normalization', type=str, nargs='+', default=['l2'],
                         choices=['l2', 'min_max'],
-                        help='Normalization technique (default: l2 or from model)')
-    parser.add_argument('--combination', type=str, default='arithmetic_mean',
+                        help='Normalization technique(s). Single value for normal mode, multiple for --collect-configuration-data')
+    parser.add_argument('--combination', type=str, nargs='+', default=['arithmetic_mean'],
                         choices=['arithmetic_mean', 'geometric_mean', 'harmonic_mean'],
-                        help='Combination technique (default: arithmetic_mean or from model)')
+                        help='Combination technique(s). Single value for normal mode, multiple for --collect-configuration-data')
     parser.add_argument('--output-file', type=str, default=None,
                         help='Output file name for results (default: {model_name}_evaluation.json or static_evaluation.json)')
     parser.add_argument('--skip-static', action='store_true',
                         help='Skip static weight evaluation when running model evaluation')
+    # Data collection parameters (only for static-only mode)
+    parser.add_argument('--collect-configuration-data', action='store_true',
+                        help='Collect detailed configuration data in CSV format (only with --static-only). Tests all combinations of normalization and combination parameters.')
+    parser.add_argument('--csv-output-file', type=str, default=None,
+                        help='Output CSV file for configuration data (default: search_configuration_data_{dataset}.csv)')
     args = parser.parse_args()
     
     # Validate arguments
@@ -393,6 +398,19 @@ def main():
     
     if args.skip_static and args.static_only:
         parser.error("--skip-static cannot be used with --static-only mode")
+    
+    if args.collect_configuration_data and not args.static_only:
+        parser.error("--collect-configuration-data can only be used with --static-only mode")
+    
+    # When not collecting configuration data, only allow single normalization/combination
+    if not args.collect_configuration_data:
+        if len(args.normalization) > 1:
+            parser.error("Multiple normalizations only allowed with --collect-configuration-data")
+        if len(args.combination) > 1:
+            parser.error("Multiple combinations only allowed with --collect-configuration-data")
+        # Extract single values for normal operation
+        args.normalization = args.normalization[0]
+        args.combination = args.combination[0]
     
     print("="*70)
     if args.static_only:
@@ -448,6 +466,7 @@ def main():
         lexical_fields = dataset_config.get('lexical_fields', ['title_key^2', 'text_key'])
         
         # Use normalization and combination from model or override
+        # Note: In non-static mode, these are already single values
         if args.normalization == 'l2':
             args.normalization = model_data.get('normalization', 'l2')
         if args.combination == 'arithmetic_mean':
@@ -487,8 +506,9 @@ def main():
         opensearch_port = args.opensearch_port
         index_name = args.index_name
         model_id = args.model_id
-        normalization = args.normalization
-        combination = args.combination
+        # For static-only without data collection, use single values
+        normalization = args.normalization if not args.collect_configuration_data else args.normalization[0]
+        combination = args.combination if not args.collect_configuration_data else args.combination[0]
         
         print(f"Dataset path: {dataset_path}")
         print(f"Binary relevance: {binary_relevance}")
@@ -566,6 +586,139 @@ def main():
     per_query_optimal_weights = {}
     per_query_ndcg_by_weight = {}
     oracle_ndcg_by_k = {k: 0.0 for k in k_values}
+    
+    # Data collection mode for detailed configuration testing
+    if args.static_only and args.collect_configuration_data:
+        print("\n" + "="*70)
+        print("COLLECTING SEARCH CONFIGURATION DATA")
+        print("="*70)
+        
+        weight_steps = list(np.arange(0.0, 1.1, 0.1))
+        
+        # Calculate total configurations
+        total_configs = len(args.normalization) * len(args.combination) * len(weight_steps)
+        total_tests = len(test_queries) * total_configs
+        
+        print(f"\nTesting configurations:")
+        print(f"- Normalizations: {args.normalization}")
+        print(f"- Combinations: {args.combination}")
+        print(f"- Weight steps: {len(weight_steps)}")
+        print(f"- k values: {k_values}")
+        print(f"Total tests: {total_tests} ({len(test_queries)} queries × {total_configs} configs)")
+        
+        # Collect detailed data
+        configuration_results = []
+        
+        with tqdm(total=total_tests, desc="Testing configurations") as pbar:
+            for query_id, query_text in test_queries.items():
+                if query_id not in query_ratings:
+                    pbar.update(total_configs)
+                    continue
+                
+                # Prepare relevance dict
+                if binary_relevance:
+                    relevant_docs = set(r['doc_id'] for r in query_ratings[query_id])
+                else:
+                    relevant_docs = {r['doc_id']: r['rating'] for r in query_ratings[query_id]}
+                
+                # Test each configuration
+                for norm_technique in args.normalization:
+                    for comb_technique in args.combination:
+                        # Create a new client for this configuration
+                        config_client = GenericOpenSearchClient(
+                            host=opensearch_host,
+                            port=opensearch_port,
+                            index_name=index_name,
+                            model_id=model_id,
+                            neural_field=neural_field,
+                            lexical_fields=lexical_fields,
+                            normalization=norm_technique,
+                            combination=comb_technique
+                        )
+                        
+                        for neural_weight in weight_steps:
+                            neural_weight = round(neural_weight, 1)
+                            lexical_weight = round(1.0 - neural_weight, 1)
+                            
+                            # Execute search
+                            ranked_docs = config_client.execute_hybrid_search(query_text, neural_weight)
+                            
+                            # Calculate NDCG for each k
+                            result_row = {
+                                'query_id': query_id,
+                                'query_text': query_text[:100],  # Truncate long queries
+                                'normalization': norm_technique,
+                                'combination': comb_technique,
+                                'neural_weight': neural_weight,
+                                'lexical_weight': lexical_weight,
+                            }
+                            
+                            for k in k_values:
+                                ndcg = compute_ndcg_at_k(ranked_docs, relevant_docs, k, binary_relevance)
+                                result_row[f'ndcg@{k}'] = ndcg
+                            
+                            configuration_results.append(result_row)
+                            pbar.update(1)
+        
+        # Convert to DataFrame and save CSV
+        df = pd.DataFrame(configuration_results)
+        
+        if args.csv_output_file:
+            csv_output_path = args.csv_output_file
+        else:
+            dataset_name = os.path.basename(dataset_path)
+            csv_output_path = f'dynamic_hybrid/search_configuration_data_{dataset_name}.csv'
+        
+        df.to_csv(csv_output_path, index=False)
+        
+        print(f"\nConfiguration data saved to {csv_output_path}")
+        print(f"Total rows: {len(df)}")
+        
+        # Display summary statistics
+        print("\n" + "="*70)
+        print("SUMMARY STATISTICS")
+        print("="*70)
+        
+        for k in k_values:
+            print(f"\nNDCG@{k}:")
+            print(f"  Mean: {df[f'ndcg@{k}'].mean():.4f}")
+            print(f"  Std:  {df[f'ndcg@{k}'].std():.4f}")
+            print(f"  Min:  {df[f'ndcg@{k}'].min():.4f}")
+            print(f"  Max:  {df[f'ndcg@{k}'].max():.4f}")
+        
+        # Best configuration for each normalization/combination
+        print("\n" + "="*70)
+        print("BEST CONFIGURATIONS")
+        print("="*70)
+        
+        for norm in args.normalization:
+            for comb in args.combination:
+                subset = df[(df['normalization'] == norm) & (df['combination'] == comb)]
+                if not subset.empty:
+                    avg_by_weight = subset.groupby('lexical_weight')[f'ndcg@{k_values[1]}'].mean()
+                    best_weight = avg_by_weight.idxmax()
+                    best_ndcg = avg_by_weight.max()
+                    print(f"\n{norm} + {comb}:")
+                    print(f"  Best lexical weight: {best_weight}")
+                    print(f"  Best NDCG@{k_values[1]}: {best_ndcg:.4f}")
+        
+        # Also run standard evaluation for the current configuration
+        # (using the original normalization and combination from command line)
+        print("\n" + "="*70)
+        print("STANDARD STATIC WEIGHT EVALUATION")
+        print("="*70)
+        
+        # Reset client to original configuration
+        opensearch_client = GenericOpenSearchClient(
+            host=opensearch_host,
+            port=opensearch_port,
+            index_name=index_name,
+            model_id=model_id,
+            neural_field=neural_field,
+            lexical_fields=lexical_fields,
+            normalization=normalization,
+            combination=combination
+        )
     
     if not args.skip_static or args.static_only:
         print("\n" + "="*70)
