@@ -562,6 +562,11 @@ def main():
     best_static_weight = None
     best_static_ndcg = None
     
+    # New: Track per-query optimal weights and oracle performance
+    per_query_optimal_weights = {}
+    per_query_ndcg_by_weight = {}
+    oracle_ndcg_by_k = {k: 0.0 for k in k_values}
+    
     if not args.skip_static or args.static_only:
         print("\n" + "="*70)
         print("1. EVALUATING STATIC WEIGHTS ON TEST SET")
@@ -570,6 +575,8 @@ def main():
         print("\nTesting different weight combinations...")
         
         weight_steps = list(np.arange(0.0, 1.1, 0.1))
+        
+        # First pass: collect NDCG for each query at each weight
         for neural_weight in tqdm(weight_steps, desc="Testing weights"):
             neural_weight = round(neural_weight, 1)
             lexical_weight = round(1.0 - neural_weight, 1)
@@ -582,6 +589,10 @@ def main():
                 if query_id not in query_ratings:
                     continue
                 
+                # Initialize per-query tracking if needed
+                if query_id not in per_query_ndcg_by_weight:
+                    per_query_ndcg_by_weight[query_id] = {}
+                
                 # Prepare relevance dict based on type
                 if binary_relevance:
                     relevant_docs = set(r['doc_id'] for r in query_ratings[query_id])
@@ -591,6 +602,9 @@ def main():
                 ranked_docs = opensearch_client.execute_hybrid_search(query_text, neural_weight)
                 ndcg_scores = compute_ndcg_at_multiple_k(ranked_docs, relevant_docs, k_values, binary_relevance)
                 
+                # Store per-query NDCG for this weight
+                per_query_ndcg_by_weight[query_id][lexical_weight] = ndcg_scores
+                
                 for k in k_values:
                     total_ndcg_by_k[k] += ndcg_scores[f'ndcg@{k}']
                 query_count += 1
@@ -599,6 +613,31 @@ def main():
             for k in k_values:
                 avg_ndcg = total_ndcg_by_k[k] / query_count if query_count > 0 else 0.0
                 static_results_by_k[k][lexical_weight] = avg_ndcg
+        
+        # Second pass: find optimal weight per query and calculate oracle performance
+        for query_id in per_query_ndcg_by_weight:
+            query_optimal = {'weights': {}, 'ndcg': {}}
+            
+            for k in k_values:
+                # Find best weight for this query at this k
+                best_weight = None
+                best_ndcg = 0.0
+                
+                for weight, ndcg_scores in per_query_ndcg_by_weight[query_id].items():
+                    if ndcg_scores[f'ndcg@{k}'] >= best_ndcg:
+                        best_ndcg = ndcg_scores[f'ndcg@{k}']
+                        best_weight = weight
+                
+                query_optimal['weights'][k] = best_weight
+                query_optimal['ndcg'][k] = best_ndcg
+                oracle_ndcg_by_k[k] += best_ndcg
+            
+            per_query_optimal_weights[query_id] = query_optimal
+        
+        # Calculate average oracle NDCG
+        query_count = len(per_query_optimal_weights)
+        for k in k_values:
+            oracle_ndcg_by_k[k] = oracle_ndcg_by_k[k] / query_count if query_count > 0 else 0.0
         
         # Display results for each k
         print("\nStatic Weight Results (Test Set):")
@@ -616,6 +655,44 @@ def main():
         static_results = static_results_by_k[10]
         best_static_weight = max(static_results, key=static_results.get)
         best_static_ndcg = static_results[best_static_weight]
+        
+        # NEW: Display optimal weight distribution analysis
+        print("\n" + "="*70)
+        print("OPTIMAL WEIGHT DISTRIBUTION ANALYSIS")
+        print("="*70)
+        
+        # Analyze distribution of optimal weights for NDCG@10
+        optimal_weights_k10 = [q['weights'][10] for q in per_query_optimal_weights.values()]
+        weight_counts = pd.Series(optimal_weights_k10).value_counts().sort_index()
+        
+        print("\nDistribution of Optimal Weights (NDCG@10):")
+        print("-" * 40)
+        for weight, count in weight_counts.items():
+            percentage = (count / len(optimal_weights_k10)) * 100
+            print(f"Lexical {weight:.1f}: {count:3d} queries ({percentage:5.1f}%)")
+        
+        # Calculate statistics
+        weights_array = np.array(optimal_weights_k10)
+        print(f"\nStatistics:")
+        print(f"Mean optimal weight: {weights_array.mean():.2f}")
+        print(f"Std deviation: {weights_array.std():.2f}")
+        print(f"Median: {np.median(weights_array):.2f}")
+        
+        # Show oracle performance comparison
+        print("\n" + "="*70)
+        print("ORACLE PERFORMANCE (Perfect Weight Prediction)")
+        print("="*70)
+        
+        for k in k_values:
+            best_static_k = max(static_results_by_k[k], key=static_results_by_k[k].get)
+            best_static_ndcg_k = static_results_by_k[k][best_static_k]
+            oracle_improvement = ((oracle_ndcg_by_k[k] - best_static_ndcg_k) / best_static_ndcg_k) * 100 if best_static_ndcg_k > 0 else 0
+            
+            print(f"\n--- NDCG@{k} ---")
+            print(f"Best Static Weight: {best_static_k:.1f}")
+            print(f"Best Static NDCG@{k}: {best_static_ndcg_k:.4f}")
+            print(f"Oracle NDCG@{k}: {oracle_ndcg_by_k[k]:.4f}")
+            print(f"Maximum Possible Improvement: {oracle_improvement:+.2f}%")
     else:
         print("\n" + "="*70)
         print("SKIPPING STATIC WEIGHT EVALUATION (--skip-static)")
@@ -783,6 +860,11 @@ def main():
         # Add static results if they were computed
         if not args.skip_static:
             improvement = ((avg_dynamic_ndcg - best_static_ndcg) / best_static_ndcg) * 100 if best_static_ndcg > 0 else 0
+            oracle_improvement = ((oracle_ndcg_by_k[10] - best_static_ndcg) / best_static_ndcg) * 100 if best_static_ndcg > 0 else 0
+            
+            # Calculate optimal weight distribution stats
+            optimal_weights_k10 = [q['weights'][10] for q in per_query_optimal_weights.values()]
+            
             results.update({
                 'static_results': {f'{k:.1f}': float(v) for k, v in static_results.items()},
                 'static_results_by_k': {
@@ -792,6 +874,16 @@ def main():
                 'best_static_weight': float(best_static_weight),
                 'best_static_ndcg': float(best_static_ndcg),
                 'improvement_percent': float(improvement),
+                'oracle_performance': {
+                    'oracle_ndcg_by_k': {k: float(v) for k, v in oracle_ndcg_by_k.items()},
+                    'oracle_improvement_percent': float(oracle_improvement),
+                    'optimal_weight_distribution': {float(k): int(v) for k, v in pd.Series(optimal_weights_k10).value_counts().sort_index().items()},
+                    'optimal_weight_stats': {
+                        'mean': float(np.mean(optimal_weights_k10)),
+                        'std': float(np.std(optimal_weights_k10)),
+                        'median': float(np.median(optimal_weights_k10))
+                    }
+                }
             })
         else:
             results['static_evaluation'] = "skipped"
@@ -803,6 +895,10 @@ def main():
             evaluation_path = f'dynamic_hybrid/{args.model_name}_evaluation.json'
     else:
         # Static-only results
+        # Calculate optimal weight distribution stats for static-only mode
+        optimal_weights_k10 = [q['weights'][10] for q in per_query_optimal_weights.values()]
+        oracle_improvement = ((oracle_ndcg_by_k[10] - best_static_ndcg) / best_static_ndcg) * 100 if best_static_ndcg > 0 else 0
+        
         results = {
             'dataset': os.path.basename(dataset_path),
             'mode': 'static_only',
@@ -820,6 +916,16 @@ def main():
                     'ndcg': float(max(static_results_by_k[k].values()))
                 }
                 for k in k_values
+            },
+            'oracle_performance': {
+                'oracle_ndcg_by_k': {k: float(v) for k, v in oracle_ndcg_by_k.items()},
+                'oracle_improvement_percent': float(oracle_improvement),
+                'optimal_weight_distribution': {float(k): int(v) for k, v in pd.Series(optimal_weights_k10).value_counts().sort_index().items()},
+                'optimal_weight_stats': {
+                    'mean': float(np.mean(optimal_weights_k10)),
+                    'std': float(np.std(optimal_weights_k10)),
+                    'median': float(np.median(optimal_weights_k10))
+                }
             },
             'opensearch_config': {
                 'host': opensearch_host,
