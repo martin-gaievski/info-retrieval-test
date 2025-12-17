@@ -13,11 +13,118 @@ import requests
 import argparse
 import random
 import os
+import zipfile
+import urllib.request
 from collections import defaultdict
 from opensearchpy import OpenSearch
 from tqdm import tqdm
 import warnings
 warnings.filterwarnings('ignore')
+
+# BEIR dataset URLs
+BEIR_DATASETS = {
+    'fiqa': 'https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/fiqa.zip',
+    'trec-covid': 'https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/trec-covid.zip',
+    'nfcorpus': 'https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/nfcorpus.zip',
+    'scifact': 'https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/scifact.zip',
+    'scidocs': 'https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/scidocs.zip',
+    'arguana': 'https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/arguana.zip',
+    'webis-touche2020': 'https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/webis-touche2020.zip',
+    'quora': 'https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/quora.zip',
+    'dbpedia-entity': 'https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/dbpedia-entity.zip',
+    'fever': 'https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/fever.zip',
+    'climate-fever': 'https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/climate-fever.zip',
+    'hotpotqa': 'https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/hotpotqa.zip',
+    'nq': 'https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/nq.zip',
+    'msmarco': 'https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/msmarco.zip',
+    'cqadupstack': 'https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/cqadupstack.zip',
+    'signal1m': 'https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/signal1m.zip',
+    'trec-news': 'https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/trec-news.zip',
+    'robust04': 'https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/robust04.zip',
+    'bioasq': 'https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/bioasq.zip',
+}
+
+def dataset_exists(dataset_path):
+    """Check if a BEIR dataset exists at the given path"""
+    queries_file = os.path.join(dataset_path, 'queries.jsonl')
+    qrels_dir = os.path.join(dataset_path, 'qrels')
+    
+    if not os.path.exists(queries_file):
+        return False
+    if not os.path.exists(qrels_dir):
+        return False
+    
+    # Check for at least one qrels file
+    qrels_files = ['test.tsv', 'train.tsv', 'dev.tsv']
+    has_qrels = any(os.path.exists(os.path.join(qrels_dir, f)) for f in qrels_files)
+    
+    return has_qrels
+
+
+def download_beir_dataset(dataset_name, target_dir):
+    """Download a BEIR dataset if it doesn't exist
+    
+    Args:
+        dataset_name: Name of the dataset (e.g., 'fiqa', 'nfcorpus')
+        target_dir: Directory to extract dataset to (parent of dataset folder)
+    
+    Returns:
+        Path to the extracted dataset
+    """
+    dataset_path = os.path.join(target_dir, dataset_name)
+    
+    # Check if dataset already exists
+    if dataset_exists(dataset_path):
+        print(f"Dataset '{dataset_name}' already exists at {dataset_path}")
+        return dataset_path
+    
+    # Check if we have URL for this dataset
+    if dataset_name not in BEIR_DATASETS:
+        available = ', '.join(sorted(BEIR_DATASETS.keys()))
+        raise ValueError(f"Unknown BEIR dataset: '{dataset_name}'. Available datasets: {available}")
+    
+    url = BEIR_DATASETS[dataset_name]
+    zip_path = os.path.join(target_dir, f"{dataset_name}.zip")
+    
+    print(f"\nDownloading BEIR dataset '{dataset_name}'...")
+    print(f"URL: {url}")
+    
+    # Create target directory if needed
+    os.makedirs(target_dir, exist_ok=True)
+    
+    # Download with progress bar
+    def reporthook(block_num, block_size, total_size):
+        downloaded = block_num * block_size
+        if total_size > 0:
+            percent = min(100, downloaded * 100 / total_size)
+            mb_downloaded = downloaded / (1024 * 1024)
+            mb_total = total_size / (1024 * 1024)
+            print(f"\rDownloading: {percent:.1f}% ({mb_downloaded:.1f}/{mb_total:.1f} MB)", end='', flush=True)
+    
+    try:
+        urllib.request.urlretrieve(url, zip_path, reporthook)
+        print()  # New line after progress
+    except Exception as e:
+        raise RuntimeError(f"Failed to download dataset: {e}")
+    
+    # Extract zip file
+    print(f"Extracting to {target_dir}...")
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(target_dir)
+    except Exception as e:
+        raise RuntimeError(f"Failed to extract dataset: {e}")
+    
+    # Clean up zip file
+    os.remove(zip_path)
+    print(f"Dataset extracted to {dataset_path}")
+    
+    # Verify extraction
+    if not dataset_exists(dataset_path):
+        raise RuntimeError(f"Dataset extraction failed - required files not found at {dataset_path}")
+    
+    return dataset_path
+
 
 # Common English stopwords
 STOPWORDS = {
@@ -160,8 +267,17 @@ class GenericOpenSearchClient:
             return []
 
 
-def load_test_queries(dataset_path, requires_split, split_ratio=None, seed=42):
-    """Load test queries based on dataset type"""
+def load_test_queries(dataset_path, requires_split, split_ratio=None, seed=42, qrels_file=None):
+    """Load test queries based on dataset type
+    
+    Args:
+        dataset_path: Path to dataset directory
+        requires_split: Whether to create train/test split
+        split_ratio: Ratio for train/test split
+        seed: Random seed for split
+        qrels_file: Specific qrels file to use (e.g., 'dev.tsv', 'train.tsv', 'test.tsv').
+                   If provided, overrides default file selection logic.
+    """
     queries = {}
     queries_file = os.path.join(dataset_path, 'queries.jsonl')
     
@@ -209,18 +325,26 @@ def load_test_queries(dataset_path, requires_split, split_ratio=None, seed=42):
         
         test_queries = {qid: queries[qid] for qid in test_ids if qid in queries}
     else:
-        # When no split is required, prefer train.tsv over test.tsv if available
-        # This gives more queries for static analysis since train sets are typically larger
-        train_ratings_file = os.path.join(dataset_path, 'qrels', 'train.tsv')
-        test_ratings_file = os.path.join(dataset_path, 'qrels', 'test.tsv')
-        
-        # Use train.tsv if it exists, otherwise fallback to test.tsv
-        if os.path.exists(train_ratings_file):
-            ratings_file = train_ratings_file
-            print(f"Using train.tsv for query selection (train.tsv exists)")
+        # When no split is required, check if a specific qrels file was requested
+        if qrels_file:
+            # Use the explicitly specified qrels file
+            ratings_file = os.path.join(dataset_path, 'qrels', qrels_file)
+            if not os.path.exists(ratings_file):
+                raise FileNotFoundError(f"Specified qrels file not found: {ratings_file}")
+            print(f"Using {qrels_file} for query selection (explicitly specified via --qrels-file)")
         else:
-            ratings_file = test_ratings_file
-            print(f"Using test.tsv for query selection (no train.tsv found)")
+            # Default behavior: prefer train.tsv over test.tsv if available
+            # This gives more queries for static analysis since train sets are typically larger
+            train_ratings_file = os.path.join(dataset_path, 'qrels', 'train.tsv')
+            test_ratings_file = os.path.join(dataset_path, 'qrels', 'test.tsv')
+            
+            # Use train.tsv if it exists, otherwise fallback to test.tsv
+            if os.path.exists(train_ratings_file):
+                ratings_file = train_ratings_file
+                print(f"Using train.tsv for query selection (train.tsv exists)")
+            else:
+                ratings_file = test_ratings_file
+                print(f"Using test.tsv for query selection (no train.tsv found)")
         
         query_ids = set()
         with open(ratings_file, 'r', encoding='utf-8') as f:
@@ -235,19 +359,33 @@ def load_test_queries(dataset_path, requires_split, split_ratio=None, seed=42):
     return test_queries
 
 
-def load_ratings(dataset_path):
-    """Load all ratings from dataset"""
+def load_ratings(dataset_path, qrels_file=None):
+    """Load all ratings from dataset
+    
+    Args:
+        dataset_path: Path to dataset directory
+        qrels_file: Specific qrels file to use. If provided, only loads ratings from this file.
+    """
     ratings_data = []
     
-    # Check for test.tsv (datasets with split) or both train.tsv and test.tsv
-    ratings_files = []
-    test_file = os.path.join(dataset_path, 'qrels', 'test.tsv')
-    train_file = os.path.join(dataset_path, 'qrels', 'train.tsv')
-    
-    if os.path.exists(test_file):
-        ratings_files.append(test_file)
-    if os.path.exists(train_file):
-        ratings_files.append(train_file)
+    if qrels_file:
+        # Use only the specified qrels file
+        ratings_files = [os.path.join(dataset_path, 'qrels', qrels_file)]
+        if not os.path.exists(ratings_files[0]):
+            raise FileNotFoundError(f"Specified qrels file not found: {ratings_files[0]}")
+    else:
+        # Check for test.tsv (datasets with split) or both train.tsv and test.tsv
+        ratings_files = []
+        test_file = os.path.join(dataset_path, 'qrels', 'test.tsv')
+        train_file = os.path.join(dataset_path, 'qrels', 'train.tsv')
+        dev_file = os.path.join(dataset_path, 'qrels', 'dev.tsv')
+        
+        if os.path.exists(test_file):
+            ratings_files.append(test_file)
+        if os.path.exists(train_file):
+            ratings_files.append(train_file)
+        if os.path.exists(dev_file):
+            ratings_files.append(dev_file)
     
     for ratings_file in ratings_files:
         with open(ratings_file, 'r', encoding='utf-8') as f:
@@ -387,6 +525,8 @@ def main():
                         help='Collect detailed configuration data in CSV format (only with --static-only). Tests all combinations of normalization and combination parameters.')
     parser.add_argument('--csv-output-file', type=str, default=None,
                         help='Output CSV file for configuration data (default: search_configuration_data_{dataset}.csv)')
+    parser.add_argument('--qrels-file', type=str, default=None,
+                        help='Specific qrels file to use (e.g., dev.tsv, train.tsv, test.tsv). Overrides default file selection.')
     args = parser.parse_args()
     
     # Validate arguments
@@ -520,6 +660,21 @@ def main():
         print(f"Binary relevance: {binary_relevance}")
         print(f"Dataset requires split: {requires_split}")
     
+    # Check if dataset exists, auto-download if it's a known BEIR dataset
+    if not dataset_exists(dataset_path):
+        dataset_name = os.path.basename(dataset_path)
+        parent_dir = os.path.dirname(dataset_path)
+        
+        if dataset_name in BEIR_DATASETS:
+            print(f"\nDataset not found at {dataset_path}")
+            dataset_path = download_beir_dataset(dataset_name, parent_dir or 'datasets')
+        else:
+            raise FileNotFoundError(
+                f"Dataset not found at {dataset_path}.\n"
+                f"For BEIR datasets, use a path like 'datasets/fiqa' and it will be auto-downloaded.\n"
+                f"Available BEIR datasets for auto-download: {', '.join(sorted(BEIR_DATASETS.keys()))}"
+            )
+    
     # Initialize OpenSearch client
     opensearch_client = GenericOpenSearchClient(
         host=opensearch_host,
@@ -557,10 +712,10 @@ def main():
         test_queries = {qid: text for qid, text in test_queries.items() if qid in query_ids_with_ratings}
         print(f"Using ALL {len(test_queries)} queries with ratings")
     elif args.static_only:
-        test_queries = load_test_queries(dataset_path, requires_split, args.split_ratio, args.seed)
+        test_queries = load_test_queries(dataset_path, requires_split, args.split_ratio, args.seed, args.qrels_file)
     else:
-        test_queries = load_test_queries(dataset_path, requires_split)
-    ratings_data = load_ratings(dataset_path)
+        test_queries = load_test_queries(dataset_path, requires_split, qrels_file=args.qrels_file)
+    ratings_data = load_ratings(dataset_path, args.qrels_file)
     
     print(f"Loaded {len(test_queries)} test queries")
     print(f"Loaded {len(ratings_data)} ratings")
