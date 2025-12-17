@@ -209,18 +209,28 @@ def load_test_queries(dataset_path, requires_split, split_ratio=None, seed=42):
         
         test_queries = {qid: queries[qid] for qid in test_ids if qid in queries}
     else:
-        # Load test ratings to get test query IDs
+        # When no split is required, prefer train.tsv over test.tsv if available
+        # This gives more queries for static analysis since train sets are typically larger
+        train_ratings_file = os.path.join(dataset_path, 'qrels', 'train.tsv')
         test_ratings_file = os.path.join(dataset_path, 'qrels', 'test.tsv')
-        test_query_ids = set()
         
-        with open(test_ratings_file, 'r', encoding='utf-8') as f:
+        # Use train.tsv if it exists, otherwise fallback to test.tsv
+        if os.path.exists(train_ratings_file):
+            ratings_file = train_ratings_file
+            print(f"Using train.tsv for query selection (train.tsv exists)")
+        else:
+            ratings_file = test_ratings_file
+            print(f"Using test.tsv for query selection (no train.tsv found)")
+        
+        query_ids = set()
+        with open(ratings_file, 'r', encoding='utf-8') as f:
             next(f)  # Skip header
             for line in f:
                 parts = line.strip().split('\t')
                 if len(parts) >= 3:
-                    test_query_ids.add(parts[0])
+                    query_ids.add(parts[0])
         
-        test_queries = {qid: queries[qid] for qid in test_query_ids if qid in queries}
+        test_queries = {qid: queries[qid] for qid in query_ids if qid in queries}
     
     return test_queries
 
@@ -492,12 +502,8 @@ def main():
     else:
         # Static-only mode: use command line arguments
         dataset_path = args.dataset_path
+        # In static-only mode, only split if explicitly requested via --requires-split flag
         requires_split = args.requires_split
-        if not requires_split:
-            # Check if separate train/test files exist
-            train_file = os.path.join(dataset_path, 'qrels', 'train.tsv')
-            test_file = os.path.join(dataset_path, 'qrels', 'test.tsv')
-            requires_split = not (os.path.exists(train_file) and os.path.exists(test_file))
         
         binary_relevance = args.binary_relevance
         neural_field = args.neural_field
