@@ -176,6 +176,63 @@ class GenericOpenSearchClient:
         print(f"Lexical fields: {lexical_fields}")
         print(f"Normalization: {normalization}, Combination: {combination}")
     
+    def execute_neural_search_with_scores(self, query, size=100):
+        """Execute neural-only search and return doc_ids with their raw scores"""
+        url = f"http://{self.host}:{self.port}/{self.index_name}/_search"
+        headers = {'Content-Type': 'application/json'}
+        
+        payload = {
+            "_source": ["_id"],
+            "query": {
+                "neural": {
+                    self.neural_field: {
+                        "query_text": query,
+                        "model_id": self.model_id,
+                        "k": size
+                    }
+                }
+            },
+            "size": size
+        }
+        
+        try:
+            response = requests.post(url, headers=headers, data=json.dumps(payload), timeout=30)
+            response.raise_for_status()
+            result = response.json()
+            # Return list of (doc_id, score) tuples
+            hits = result.get('hits', {}).get('hits', [])
+            return [(hit['_id'], hit.get('_score', 0.0)) for hit in hits]
+        except Exception as e:
+            return []
+    
+    def execute_lexical_search_with_scores(self, query, size=100):
+        """Execute lexical-only (multi_match) search and return doc_ids with their raw scores"""
+        url = f"http://{self.host}:{self.port}/{self.index_name}/_search"
+        headers = {'Content-Type': 'application/json'}
+        
+        payload = {
+            "_source": ["_id"],
+            "query": {
+                "multi_match": {
+                    "query": query,
+                    "type": "best_fields",
+                    "operator": "or",
+                    "fields": self.lexical_fields
+                }
+            },
+            "size": size
+        }
+        
+        try:
+            response = requests.post(url, headers=headers, data=json.dumps(payload), timeout=30)
+            response.raise_for_status()
+            result = response.json()
+            # Return list of (doc_id, score) tuples
+            hits = result.get('hits', {}).get('hits', [])
+            return [(hit['_id'], hit.get('_score', 0.0)) for hit in hits]
+        except Exception as e:
+            return []
+    
     def execute_hybrid_search(self, query, neural_weight, size=100):
         """Execute hybrid search with given neural/lexical weights"""
         lexical_weight = round(1.0 - neural_weight, 2)
@@ -527,6 +584,10 @@ def main():
                         help='Output CSV file for configuration data (default: search_configuration_data_{dataset}.csv)')
     parser.add_argument('--qrels-file', type=str, default=None,
                         help='Specific qrels file to use (e.g., dev.tsv, train.tsv, test.tsv). Overrides default file selection.')
+    parser.add_argument('--collect-raw-scores', action='store_true',
+                        help='Collect raw scores from neural and lexical sub-queries (runs once, independent of weights)')
+    parser.add_argument('--raw-scores-output-file', type=str, default=None,
+                        help='Output CSV file for raw scores (default: raw_scores_{dataset}.csv)')
     args = parser.parse_args()
     
     # Validate arguments
@@ -736,6 +797,73 @@ def main():
     # Define k values for evaluation
     k_values = [1, 10, 100]
     print(f"\nWill evaluate at k values: {k_values}")
+    
+    # Collect raw scores if requested (runs once, independent of weights)
+    if args.collect_raw_scores:
+        print("\n" + "="*70)
+        print("COLLECTING RAW SCORES FROM SUB-QUERIES")
+        print("="*70)
+        print("\nRunning neural and lexical searches to collect raw scores...")
+        print("(This runs once since raw scores are independent of hybrid weights)")
+        
+        raw_scores_data = []
+        
+        for query_id, query_text in tqdm(test_queries.items(), desc="Collecting raw scores"):
+            # Execute neural-only search with scores
+            neural_results = opensearch_client.execute_neural_search_with_scores(query_text, size=100)
+            neural_scores = {doc_id: score for doc_id, score in neural_results}
+            
+            # Execute lexical-only search with scores
+            lexical_results = opensearch_client.execute_lexical_search_with_scores(query_text, size=100)
+            lexical_scores = {doc_id: score for doc_id, score in lexical_results}
+            
+            # Combine all doc_ids from both searches
+            all_doc_ids = set(neural_scores.keys()) | set(lexical_scores.keys())
+            
+            # Store scores for each document
+            for rank, (doc_id, neural_score) in enumerate(neural_results):
+                lexical_score = lexical_scores.get(doc_id, 0.0)
+                raw_scores_data.append({
+                    'query_id': query_id,
+                    'doc_id': doc_id,
+                    'neural_rank': rank + 1,
+                    'neural_score': neural_score,
+                    'lexical_score': lexical_score
+                })
+            
+            # Add docs that appear only in lexical results (not in neural top-100)
+            for rank, (doc_id, lexical_score) in enumerate(lexical_results):
+                if doc_id not in neural_scores:
+                    raw_scores_data.append({
+                        'query_id': query_id,
+                        'doc_id': doc_id,
+                        'neural_rank': -1,  # Not in neural top-100
+                        'neural_score': 0.0,
+                        'lexical_score': lexical_score
+                    })
+        
+        # Convert to DataFrame and save
+        raw_scores_df = pd.DataFrame(raw_scores_data)
+        
+        # Determine output file path
+        if args.raw_scores_output_file:
+            raw_scores_path = args.raw_scores_output_file
+        else:
+            dataset_name = os.path.basename(dataset_path)
+            raw_scores_path = f'dynamic_hybrid/raw_scores_{dataset_name}.csv'
+        
+        # Save with compression if file is large (optional: use .csv.gz for compression)
+        raw_scores_df.to_csv(raw_scores_path, index=False, float_format='%.6f')
+        
+        print(f"\nRaw scores saved to {raw_scores_path}")
+        print(f"Total rows: {len(raw_scores_df):,}")
+        print(f"Unique queries: {raw_scores_df['query_id'].nunique():,}")
+        print(f"Average docs per query: {len(raw_scores_df) / raw_scores_df['query_id'].nunique():.1f}")
+        
+        # Show sample statistics
+        print("\nScore Statistics:")
+        print(f"  Neural scores - min: {raw_scores_df['neural_score'].min():.4f}, max: {raw_scores_df['neural_score'].max():.4f}, mean: {raw_scores_df['neural_score'].mean():.4f}")
+        print(f"  Lexical scores - min: {raw_scores_df['lexical_score'].min():.4f}, max: {raw_scores_df['lexical_score'].max():.4f}, mean: {raw_scores_df['lexical_score'].mean():.4f}")
     
     # 1. Evaluate static weights on test set (unless skipped)
     static_results_by_k = {k: {} for k in k_values}
