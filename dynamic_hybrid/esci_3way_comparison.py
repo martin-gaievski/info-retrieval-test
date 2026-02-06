@@ -235,11 +235,11 @@ class ESCIComparison:
         self.cache = cache
         self.debug = debug
         
-        # Field mapping for ESCI index (based on esci_ingestion.py)
-        self.neural_field = "product_title_embedding"
+        # Field mapping for ESCI index (actual fields in esci-products index)
+        self.neural_field = "info_embedding"   # knn_vector field for neural search
         self.text_field = "product_description"  # Main text content field
         self.title_field = "product_title"    # Title field
-        self.lexical_fields = ["product_title", "product_description", "product_brand", "product_bullet_point"]
+        self.lexical_fields = ["product_title", "product_description", "product_brand", "product_bullet_points"]
         
         # Hybrid search configurations to compare
         self.hybrid_configs = {
