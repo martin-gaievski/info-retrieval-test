@@ -239,7 +239,9 @@ class ESCIComparison:
         self.neural_field = "info_embedding"   # knn_vector field for neural search
         self.text_field = "product_description"  # Main text content field
         self.title_field = "product_title"    # Title field
-        self.lexical_fields = ["product_title", "product_description", "product_brand", "product_bullet_points"]
+        # Fields from hybrid_field_detector.py: use only 2 text fields with title boost
+        # Excludes product_brand/product_bullet_points to avoid double-counting (product_info concatenates them)
+        self.lexical_fields = ["product_title^2.0", "product_description"]
         
         # Hybrid search configurations to compare
         self.hybrid_configs = {
