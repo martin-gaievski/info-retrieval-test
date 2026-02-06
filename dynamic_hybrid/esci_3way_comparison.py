@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 """
-SciFact 3-Way Comparison Experiment with LLM Ground Truth Analysis
+ESCI 3-Way Comparison Experiment with LLM Ground Truth Analysis
 
-Compares three ranking approaches for Scientific Claim Verification domain:
+Compares three ranking approaches for E-commerce Product Search domain:
 1. Hybrid Search (per config) - direct OpenSearch hybrid query
 2. LLM-Pooled - pooled docs from multiple configs, ranked by LLM
-3. Human Labels - ground truth from SciFact qrels
+3. Human Labels - ground truth from ESCI dataset (Amazon human annotations)
 
 Usage:
-    python dynamic_hybrid/scifact_3way_comparison.py \
+    python dynamic_hybrid/esci_3way_comparison.py \
         --host <opensearch_host> \
         --port 80 \
         --embedding-model-id <model_id> \
         --llm-model-id <model_id> \
-        --num-queries 5 \
-        --cache-file scifact_llm_cache.json
+        --num-queries 50 \
+        --cache-file esci_llm_cache.json
 """
 
 import argparse
@@ -35,28 +35,28 @@ from dynamic_hybrid.inline_judgment.llm_judge import LLMJudge, LLMProvider
 from dynamic_hybrid.utils.opensearch_client import OpenSearchClient
 
 
-# Scientific Claim Verification domain prompt for SciFact
-SCIENTIFIC_SYSTEM_PROMPT = """You are an expert scientific claim verification relevance evaluator. Your task is to rate how relevant each scientific abstract is to a given claim.
+# E-commerce Product Search domain prompt for ESCI
+ECOMMERCE_SYSTEM_PROMPT = """You are an expert e-commerce product search relevance evaluator. Your task is to rate how relevant each product is to a given shopping query.
 
 Rating Scale (0.0 to 1.0 with 0.2 increments):
-- 1.0: Perfect Match - Abstract directly addresses and provides evidence for/against the claim
-- 0.8: Excellent - Highly relevant abstract, provides substantial evidence about the claim
-- 0.6: Good - Relevant abstract, partially addresses the scientific claim
-- 0.4: Fair - Some relevance but only tangentially related to the claim topic
-- 0.2: Poor - Marginally related abstract, mostly discusses unrelated topics
-- 0.0: Not Relevant - Completely unrelated to the scientific claim
+- 1.0: Exact Match - The product perfectly matches what the customer is searching for
+- 0.8: Excellent Substitute - Highly relevant product, minor differences from ideal
+- 0.6: Good Substitute - Product serves the same purpose but has notable differences
+- 0.4: Complement - Related product, often bought together or in same category
+- 0.2: Marginally Related - Same category but doesn't fulfill the search intent
+- 0.0: Not Relevant - Completely unrelated to what the customer is looking for
 
 Instructions:
-1. Evaluate each abstract independently based on its scientific content
-2. Consider whether the abstract provides evidence supporting OR refuting the claim
-3. Abstracts discussing related scientific mechanisms may be partially relevant
+1. Evaluate each product independently based on the customer's likely intent
+2. Consider product title, brand, and description
+3. A product can be relevant even if not the exact item (substitutes count)
 4. Output ONLY a JSON object with document IDs as keys and ratings as values
 5. Do not include any explanation - only the JSON object"""
 
 
 @dataclass
-class SciFacQuery:
-    """SciFact query (scientific claim)."""
+class ESCIQuery:
+    """ESCI query (shopping search)."""
     query_id: str
     text: str
 
@@ -137,34 +137,34 @@ class ResultCache:
         return list(self.cache.keys())
 
 
-def load_scifact_queries(queries_path: str) -> Dict[str, SciFacQuery]:
-    """Load SciFact queries from JSONL file."""
+def load_esci_queries(queries_path: str) -> Dict[str, ESCIQuery]:
+    """Load ESCI queries from JSON file (created by extract_esci_us_subset.py)."""
     queries = {}
     with open(queries_path, 'r') as f:
-        for line in f:
-            data = json.loads(line.strip())
-            query_id = data['_id']
-            queries[query_id] = SciFacQuery(
-                query_id=query_id,
-                text=data['text']
-            )
+        data = json.load(f)
+    for qid, qdata in data.items():
+        queries[qid] = ESCIQuery(
+            query_id=qid,
+            text=qdata['query_text']
+        )
     return queries
 
 
-def load_scifact_qrels(qrels_path: str) -> Dict[str, Dict[str, int]]:
-    """Load SciFact relevance judgments (qrels)."""
+def load_esci_qrels(qrels_path: str) -> Dict[str, Dict[str, int]]:
+    """Load ESCI relevance judgments (qrels) from TSV file."""
     qrels = defaultdict(dict)
     with open(qrels_path, 'r') as f:
         for i, line in enumerate(f):
-            # Skip header line (first line)
-            if i == 0 and ('query-id' in line.lower() or 'corpus-id' in line.lower()):
+            # Skip header line
+            if i == 0 and ('query_id' in line.lower() or 'product_id' in line.lower()):
                 continue
             parts = line.strip().split('\t')
-            if len(parts) >= 3:
+            if len(parts) >= 4:
                 query_id = parts[0]
-                doc_id = parts[1]
+                # parts[1] is always 0 (TREC format placeholder)
+                doc_id = parts[2]
                 try:
-                    score = int(parts[2])
+                    score = int(parts[3])
                     qrels[query_id][doc_id] = score
                 except ValueError:
                     continue  # Skip non-numeric scores
@@ -215,8 +215,8 @@ def compute_spearman_correlation(
         return 0.0
 
 
-class SciFacComparison:
-    """3-way comparison engine for SciFact dataset."""
+class ESCIComparison:
+    """3-way comparison engine for ESCI dataset."""
     
     def __init__(
         self,
@@ -235,11 +235,11 @@ class SciFacComparison:
         self.cache = cache
         self.debug = debug
         
-        # Field mapping for SciFact index
-        self.neural_field = "passage_embedding"
-        self.text_field = "passage_text"  # Main text content field
-        self.title_field = "title_key"    # Title field
-        self.lexical_fields = ["passage_text", "title_key", "text_key"]
+        # Field mapping for ESCI index (based on esci_ingestion.py)
+        self.neural_field = "product_title_embedding"
+        self.text_field = "product_description"  # Main text content field
+        self.title_field = "product_title"    # Title field
+        self.lexical_fields = ["product_title", "product_description", "product_brand", "product_bullet_point"]
         
         # Hybrid search configurations to compare
         self.hybrid_configs = {
@@ -271,7 +271,7 @@ class SciFacComparison:
             configs=self.pool_configs
         )
         
-        # Initialize LLM judge with scientific domain prompt
+        # Initialize LLM judge with e-commerce domain prompt
         self.llm_judge = LLMJudge(
             opensearch_url=self.opensearch_url,
             llm_model_id=llm_model_id,
@@ -280,12 +280,12 @@ class SciFacComparison:
             batch_size=15,
             debug=debug
         )
-        # Override with scientific prompt
-        self.llm_judge.SYSTEM_PROMPT = SCIENTIFIC_SYSTEM_PROMPT
+        # Override with e-commerce prompt
+        self.llm_judge.SYSTEM_PROMPT = ECOMMERCE_SYSTEM_PROMPT
     
     def run_comparison(
         self,
-        query: SciFacQuery,
+        query: ESCIQuery,
         human_relevance: Dict[str, int],
         pool_depth: int = 50,
         use_cache_only: bool = False
@@ -312,7 +312,7 @@ class SciFacComparison:
             pooled_docs, pool_results = self.pool_builder.build_pool(
                 query=query.text,
                 fetch_sources=True,
-                source_fields=[self.title_field, self.text_field],
+                source_fields=[self.title_field, self.text_field, "product_brand"],
                 verbose=self.debug
             )
             
@@ -322,9 +322,15 @@ class SciFacComparison:
             # Step 2: Get LLM judgments for pooled documents
             docs_for_llm = {}
             for doc_id, doc in pooled_docs.items():
+                # Build combined text for LLM evaluation
+                brand = doc.get("product_brand", "")
+                title = doc.get(self.title_field, "")
+                desc = doc.get(self.text_field, "")[:800]  # Truncate long descriptions
+                
+                combined_title = f"{brand} - {title}" if brand else title
                 docs_for_llm[doc_id] = {
-                    "title": doc.get(self.title_field, ""),
-                    "text": doc.get(self.text_field, "")[:1200]  # Truncate long text
+                    "title": combined_title,
+                    "text": desc
                 }
             
             llm_result = self.llm_judge.judge_documents(
@@ -389,7 +395,8 @@ class SciFacComparison:
         best_config = max(human_ndcg.keys(), key=lambda x: human_ndcg[x])
         
         # Step 6: Compute NDCG for each config vs LLM ratings as ground truth
-        llm_ground_truth = {doc_id: score * 2 for doc_id, score in llm_scores.items()}
+        # Scale LLM ratings (0-1) to match human grade scale (0-3)
+        llm_ground_truth = {doc_id: score * 3 for doc_id, score in llm_scores.items()}
         
         llm_ground_truth_ndcg = {}
         for config_name, ranking in config_rankings.items():
@@ -419,7 +426,7 @@ def print_summary(results: List[ComparisonResult], configs: List[str]):
     """Print summary statistics across all queries."""
     
     print("\n" + "="*80)
-    print("3-WAY COMPARISON SUMMARY")
+    print("3-WAY COMPARISON SUMMARY (ESCI E-commerce Dataset)")
     print("="*80)
     
     # Average NDCG per config (vs HUMAN ground truth)
@@ -544,15 +551,15 @@ def print_summary(results: List[ComparisonResult], configs: List[str]):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="SciFact 3-Way Comparison Experiment with LLM Ground Truth Analysis"
+        description="ESCI 3-Way Comparison Experiment with LLM Ground Truth Analysis"
     )
     parser.add_argument("--host", required=True, help="OpenSearch host")
     parser.add_argument("--port", type=int, default=80, help="OpenSearch port")
-    parser.add_argument("--index", default="scifact", help="Index name")
+    parser.add_argument("--index", default="esci-products", help="Index name")
     parser.add_argument("--embedding-model-id", required=True, help="Embedding model ID")
     parser.add_argument("--llm-model-id", required=True, help="LLM model ID")
-    parser.add_argument("--queries-path", default="datasets/scifact/queries.jsonl")
-    parser.add_argument("--qrels-path", default="datasets/scifact/qrels/test.tsv")
+    parser.add_argument("--queries-path", default="datasets/esci/esci_us_queries_100.json")
+    parser.add_argument("--qrels-path", default="datasets/esci/esci_us_qrels_100.tsv")
     parser.add_argument("--num-queries", type=int, default=50, help="Number of queries to evaluate")
     parser.add_argument("--pool-depth", type=int, default=50, help="Docs per config")
     parser.add_argument("--cache-file", type=str, default=None, help="Path to cache file for LLM ratings")
@@ -562,8 +569,8 @@ def main():
     args = parser.parse_args()
     
     print("="*80)
-    print("SCIFACT 3-WAY COMPARISON EXPERIMENT")
-    print("With LLM Ground Truth Analysis (Scientific Claim Verification Domain)")
+    print("ESCI 3-WAY COMPARISON EXPERIMENT")
+    print("With LLM Ground Truth Analysis (E-commerce Product Search Domain)")
     print("="*80)
     print(f"OpenSearch: http://{args.host}:{args.port}")
     print(f"Index: {args.index}")
@@ -581,8 +588,8 @@ def main():
     
     # Load queries and qrels
     print("\n[Loading data...]")
-    queries = load_scifact_queries(args.queries_path)
-    qrels = load_scifact_qrels(args.qrels_path)
+    queries = load_esci_queries(args.queries_path)
+    qrels = load_esci_qrels(args.qrels_path)
     
     print(f"  Loaded {len(queries)} queries")
     print(f"  Loaded qrels for {len(qrels)} queries")
@@ -593,10 +600,10 @@ def main():
     
     # Sample queries
     sampled_ids = valid_query_ids[:args.num_queries]
-    print(f"  Sampling first {len(sampled_ids)} queries")
+    print(f"  Using first {len(sampled_ids)} queries")
     
     # Initialize comparison engine
-    engine = SciFacComparison(
+    engine = ESCIComparison(
         opensearch_host=args.host,
         opensearch_port=args.port,
         index_name=args.index,

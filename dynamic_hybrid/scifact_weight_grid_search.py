@@ -260,20 +260,64 @@ class LLMJudge:
     """LLM-based relevance judge using GPT-3.5 Turbo."""
     
     def __init__(self, cache_path: str = None):
-        self.client = OpenAI()
+        # OpenAI client is only needed if cache miss occurs
+        self.client = None
         self.cache = {}
+        self.nested_cache = {}  # For 3way format: {query_id: {doc_id: rating}}
         self.cache_path = cache_path
+        self.cache_hits = 0
+        self.cache_misses = 0
         
         if cache_path and os.path.exists(cache_path):
             with open(cache_path, 'r') as f:
-                self.cache = json.load(f)
-            print(f"  Loaded {len(self.cache)} cached ratings")
+                raw_cache = json.load(f)
+            
+            # Detect cache format and convert if needed
+            if raw_cache:
+                first_key = next(iter(raw_cache))
+                first_value = raw_cache[first_key]
+                
+                # Check if it's the 3way format (nested with llm_ratings)
+                if isinstance(first_value, dict) and 'llm_ratings' in first_value:
+                    # Convert 3way format to flat format
+                    for qid, data in raw_cache.items():
+                        self.nested_cache[qid] = data.get('llm_ratings', {})
+                        for doc_id, rating in data.get('llm_ratings', {}).items():
+                            self.cache[f"{qid}_{doc_id}"] = rating
+                    print(f"  Loaded {len(self.cache)} cached ratings (converted from 3way format)")
+                else:
+                    # Already in flat format
+                    self.cache = raw_cache
+                    print(f"  Loaded {len(self.cache)} cached ratings")
+    
+    def _ensure_client(self):
+        """Lazy initialization of OpenAI client."""
+        if self.client is None:
+            try:
+                self.client = OpenAI()
+            except Exception as e:
+                print(f"  WARNING: Could not initialize OpenAI client: {e}")
+                return False
+        return True
     
     def rate_relevance(self, query: str, doc_title: str, doc_text: str, query_id: str, doc_id: str) -> float:
         """Rate relevance of document to query on 0-1 scale."""
         cache_key = f"{query_id}_{doc_id}"
         if cache_key in self.cache:
+            self.cache_hits += 1
             return self.cache[cache_key]
+        
+        # Also check nested cache
+        if query_id in self.nested_cache and doc_id in self.nested_cache[query_id]:
+            self.cache_hits += 1
+            return self.nested_cache[query_id][doc_id]
+        
+        self.cache_misses += 1
+        
+        # Only call LLM if client is available
+        if not self._ensure_client():
+            print(f"  Cache miss for {cache_key}, returning default 0.5 (no OpenAI client)")
+            return 0.5
         
         prompt = f"""Rate how relevant this scientific abstract is to the given claim.
 
@@ -313,10 +357,11 @@ Output ONLY a single number (0.0, 0.2, 0.4, 0.6, 0.8, or 1.0):"""
     
     def save_cache(self):
         """Save cache to file."""
-        if self.cache_path:
+        if self.cache_path and self.cache_misses > 0:
             with open(self.cache_path, 'w') as f:
                 json.dump(self.cache, f, indent=2)
             print(f"  Saved {len(self.cache)} ratings to cache")
+        print(f"  Cache stats: {self.cache_hits} hits, {self.cache_misses} misses")
 
 
 # ============================================================================
@@ -832,7 +877,7 @@ def main():
         index_name=args.index,
         embedding_model_id=args.embedding_model_id,
         neural_field="passage_embedding",
-        lexical_fields=["title", "text"]
+        lexical_fields=["passage_text", "title_key", "text_key"]
     )
     
     llm_judge = LLMJudge(cache_path=args.cache_file)
