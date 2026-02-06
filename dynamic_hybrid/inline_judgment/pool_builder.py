@@ -93,7 +93,8 @@ class PoolBuilder:
         self,
         query: str,
         fetch_sources: bool = True,
-        source_fields: Optional[List[str]] = None
+        source_fields: Optional[List[str]] = None,
+        verbose: bool = False
     ) -> Tuple[Dict[str, Dict], List[PoolResult]]:
         """
         Build a pooled document set for a single query.
@@ -102,20 +103,30 @@ class PoolBuilder:
             query: The query string
             fetch_sources: Whether to fetch document source content
             source_fields: Specific fields to fetch (None = all)
+            verbose: Print progress for each config
             
         Returns:
             Tuple of:
                 - pooled_docs: Dict[doc_id] -> {source content}
                 - pool_results: List of PoolResult for each config
         """
+        import time
         pooled_docs = OrderedDict()  # Maintains insertion order
         pool_results = []
         
-        for config in self.configs:
+        for i, config in enumerate(self.configs):
+            if verbose:
+                print(f"      [{i+1}/{len(self.configs)}] {config.name}...", end=" ", flush=True)
+            
+            start = time.time()
             result = self._execute_pool_config(
                 query, config, fetch_sources, source_fields
             )
+            elapsed = time.time() - start
             pool_results.append(result)
+            
+            if verbose:
+                print(f"{len(result.doc_ids)} docs in {elapsed:.1f}s")
             
             # Add new documents to pool
             for doc_id in result.doc_ids:
@@ -183,16 +194,28 @@ class PoolBuilder:
         query_body = self._build_hybrid_query(query, config, fetch_sources, source_fields)
         
         try:
+            # Timeout: 30s connect, 120s read (neural queries can be slow)
             response = self.client.session.post(
                 f"{self.client.base_url}/{self.index_name}/_search",
-                json=query_body
+                json=query_body,
+                timeout=(30, 120)
             )
             
             if response.status_code == 200:
                 results = response.json()
                 return self._parse_search_results(results, fetch_sources)
+            else:
+                # Print the actual error for debugging
+                print(f"    [DEBUG] {config.name} search failed - HTTP {response.status_code}")
+                try:
+                    error_body = response.json()
+                    error_type = error_body.get('error', {}).get('type', 'unknown')
+                    error_reason = error_body.get('error', {}).get('reason', response.text[:200])
+                    print(f"    [DEBUG] Error: {error_type}: {error_reason[:150]}")
+                except:
+                    print(f"    [DEBUG] Response: {response.text[:200]}")
         except Exception as e:
-            print(f"Hybrid search error for {config.name}: {str(e)}")
+            print(f"    [DEBUG] Hybrid search exception for {config.name}: {str(e)}")
             
         return [], {}, {}
     
@@ -208,16 +231,27 @@ class PoolBuilder:
         query_body = self._build_rrf_query(query, config, fetch_sources, source_fields)
         
         try:
+            # Timeout: 30s connect, 120s read (neural queries can be slow)
             response = self.client.session.post(
                 f"{self.client.base_url}/{self.index_name}/_search",
-                json=query_body
+                json=query_body,
+                timeout=(30, 120)
             )
             
             if response.status_code == 200:
                 results = response.json()
                 return self._parse_search_results(results, fetch_sources)
+            else:
+                print(f"    [DEBUG] RRF {config.name} search failed - HTTP {response.status_code}")
+                try:
+                    error_body = response.json()
+                    error_type = error_body.get('error', {}).get('type', 'unknown')
+                    error_reason = error_body.get('error', {}).get('reason', response.text[:200])
+                    print(f"    [DEBUG] Error: {error_type}: {error_reason[:150]}")
+                except:
+                    print(f"    [DEBUG] Response: {response.text[:200]}")
         except Exception as e:
-            print(f"RRF search error for {config.name}: {str(e)}")
+            print(f"    [DEBUG] RRF search exception for {config.name}: {str(e)}")
             
         return [], {}, {}
     
@@ -229,6 +263,21 @@ class PoolBuilder:
         source_fields: Optional[List[str]]
     ) -> Dict:
         """Build hybrid query with normalization pipeline."""
+        
+        # Build normalization-processor config
+        norm_processor = {
+            "normalization-processor": {
+                "normalization": {
+                    "technique": config.normalization
+                },
+                "combination": {
+                    "technique": config.combination,
+                    "parameters": {
+                        "weights": [config.lexical_weight, config.neural_weight]
+                    }
+                }
+            }
+        }
         
         query_body = {
             "size": config.pool_size,
@@ -255,22 +304,7 @@ class PoolBuilder:
                 }
             },
             "search_pipeline": {
-                "request_processors": [],
-                "response_processors": [
-                    {
-                        "normalization-processor": {
-                            "normalization": {
-                                "technique": config.normalization
-                            },
-                            "combination": {
-                                "technique": config.combination,
-                                "parameters": {
-                                    "weights": [config.lexical_weight, config.neural_weight]
-                                }
-                            }
-                        }
-                    }
-                ]
+                "phase_results_processors": [norm_processor]
             }
         }
         
@@ -291,7 +325,14 @@ class PoolBuilder:
     ) -> Dict:
         """Build RRF hybrid query."""
         
-        # RRF uses a different pipeline configuration
+        # RRF uses empty normalization/combination (defaults to RRF behavior)
+        norm_processor = {
+            "normalization-processor": {
+                "normalization": {},
+                "combination": {}
+            }
+        }
+        
         query_body = {
             "size": config.pool_size,
             "query": {
@@ -317,22 +358,7 @@ class PoolBuilder:
                 }
             },
             "search_pipeline": {
-                "request_processors": [],
-                "response_processors": [
-                    {
-                        "normalization-processor": {
-                            "normalization": {
-                                "technique": "rrf",
-                                "parameters": {
-                                    "rank_constant": config.rrf_rank_constant
-                                }
-                            },
-                            "combination": {
-                                "technique": "rrf"
-                            }
-                        }
-                    }
-                ]
+                "phase_results_processors": [norm_processor]
             }
         }
         

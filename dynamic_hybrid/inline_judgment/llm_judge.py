@@ -1,13 +1,18 @@
 """
 LLM Judge for Inline Relevancy Scoring.
 
-This module provides LLM-based relevancy judgment using AWS Bedrock (Claude)
-or other LLM providers for scoring document relevance to queries.
+This module provides LLM-based relevancy judgment using:
+1. OpenSearch ML-Commons remote connector (recommended)
+2. AWS Bedrock (Claude) direct connection (fallback)
+
+Scoring document relevance to queries with optimized prompts.
 """
 
 import json
 import re
 import time
+import hashlib
+import requests
 from typing import Dict, List, Tuple, Optional, Any
 from dataclasses import dataclass
 from enum import Enum
@@ -18,6 +23,13 @@ class RatingScale(Enum):
     GRADED_5 = "graded_5"      # 0.0, 0.2, 0.4, 0.6, 0.8, 1.0 (6 levels)
     GRADED_4 = "graded_4"      # 0.0, 0.25, 0.5, 0.75, 1.0 (5 levels)
     BINARY = "binary"          # 0.0, 1.0 (2 levels)
+
+
+class LLMProvider(Enum):
+    """LLM provider options."""
+    ML_COMMONS = "ml_commons"  # OpenSearch ML-Commons remote connector
+    BEDROCK = "bedrock"        # Direct AWS Bedrock
+    MOCK = "mock"              # Mock for testing
 
 
 @dataclass
@@ -44,76 +56,94 @@ class LLMJudge:
     """
     LLM-based relevancy judge for search evaluation.
     
-    Supports AWS Bedrock (Claude) and can be extended for other providers.
+    Supports:
+    - OpenSearch ML-Commons remote connector (calls deployed LLM via OpenSearch)
+    - AWS Bedrock (Claude) direct connection
+    
     Uses optimized prompts for deterministic relevancy scoring.
     """
     
     # Prompt template for relevancy judgment
-    SYSTEM_PROMPT = """You are an expert search relevance evaluator. Your task is to rate how relevant each document is to a given search query.
+    SYSTEM_PROMPT = """You are an expert search relevance evaluator for e-commerce product search. Your task is to rate how relevant each product is to a given search query.
 
 Rating Scale (0.0 to 1.0 with 0.2 increments):
-- 1.0: Perfect - Directly answers the query, highly relevant
-- 0.8: Excellent - Very relevant, addresses most of the query
-- 0.6: Good - Relevant content, partially addresses the query  
-- 0.4: Fair - Some relevance but missing key aspects
-- 0.2: Poor - Marginally relevant, mostly off-topic
-- 0.0: Not Relevant - Completely unrelated to the query
+- 1.0: Perfect Match - Product exactly matches what the user is searching for
+- 0.8: Excellent - Very relevant product, addresses the search intent well
+- 0.6: Good - Relevant product, partially matches the search query
+- 0.4: Fair - Some relevance but missing key attributes the user wants
+- 0.2: Poor - Marginally related product, mostly off-topic
+- 0.0: Not Relevant - Completely unrelated to the search query
 
 Instructions:
-1. Evaluate each document independently
+1. Evaluate each product independently
 2. Consider semantic meaning, not just keyword matches
-3. Output ONLY a JSON object with document IDs as keys and ratings as values
-4. Do not include any explanation - only the JSON object"""
+3. Consider product attributes like brand, color, features in context of the query
+4. Output ONLY a JSON object with document IDs as keys and ratings as values
+5. Do not include any explanation - only the JSON object"""
 
-    USER_PROMPT_TEMPLATE = """Query: {query}
+    USER_PROMPT_TEMPLATE = """Search Query: {query}
 
-Documents to evaluate:
+Products to evaluate:
 {documents}
 
-Output the ratings as a JSON object:"""
+Output the relevance ratings as a JSON object:"""
 
     def __init__(
         self,
-        model_id: str = "anthropic.claude-3-5-sonnet-20241022-v2:0",
-        region: str = "us-west-2",
+        opensearch_url: str = None,
+        llm_model_id: str = None,
+        provider: LLMProvider = LLMProvider.ML_COMMONS,
         rating_scale: RatingScale = RatingScale.GRADED_5,
         temperature: float = 0.0,
         max_tokens: int = 4096,
-        batch_size: int = 20
+        batch_size: int = 20,
+        # Bedrock fallback params
+        bedrock_model_id: str = "anthropic.claude-3-5-sonnet-20241022-v2:0",
+        bedrock_region: str = "us-west-2",
+        debug: bool = False
     ):
         """
         Initialize the LLM judge.
         
         Args:
-            model_id: Bedrock model ID for Claude
-            region: AWS region for Bedrock
+            opensearch_url: OpenSearch base URL for ML-Commons (e.g., http://host:port)
+            llm_model_id: LLM model ID deployed in ML-Commons
+            provider: Which LLM provider to use
             rating_scale: Rating scale to use
             temperature: LLM temperature (0 for deterministic)
             max_tokens: Maximum tokens for response
             batch_size: Documents per LLM call
+            bedrock_model_id: Bedrock model ID (for BEDROCK provider)
+            bedrock_region: AWS region (for BEDROCK provider)
+            debug: Enable debug logging
         """
-        self.model_id = model_id
-        self.region = region
+        self.opensearch_url = opensearch_url
+        self.llm_model_id = llm_model_id
+        self.provider = provider
         self.rating_scale = rating_scale
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.batch_size = batch_size
+        self.bedrock_model_id = bedrock_model_id
+        self.bedrock_region = bedrock_region
+        self._debug = debug
         
-        self._client = None
+        self._bedrock_client = None
+        self._session = requests.Session()
         
     @property
-    def client(self):
+    def bedrock_client(self):
         """Lazy initialization of Bedrock client."""
-        if self._client is None:
+        if self._bedrock_client is None:
             try:
                 import boto3
-                self._client = boto3.client(
+                self._bedrock_client = boto3.client(
                     'bedrock-runtime',
-                    region_name=self.region
+                    region_name=self.bedrock_region
                 )
             except ImportError:
                 raise ImportError("boto3 required for Bedrock integration. Install with: pip install boto3")
-        return self._client
+        return self._bedrock_client
     
     def judge_documents(
         self,
@@ -181,11 +211,12 @@ Output the ratings as a JSON object:"""
         # Format documents for prompt
         doc_texts = []
         for doc_id, doc in documents.items():
-            title = doc.get(title_field, "") if title_field else ""
-            content = doc.get(content_field, "")
+            # Handle None values - doc.get() can return None if key exists with None value
+            title = (doc.get(title_field) or "") if title_field else ""
+            content = doc.get(content_field) or ""
             
             # Truncate long content
-            if len(content) > 500:
+            if content and len(content) > 500:
                 content = content[:500] + "..."
                 
             if title:
@@ -202,7 +233,7 @@ Output the ratings as a JSON object:"""
         
         # Call LLM
         start_time = time.time()
-        response = self._call_bedrock(user_prompt)
+        response = self._call_llm(user_prompt)
         latency_ms = (time.time() - start_time) * 1000
         
         # Parse response
@@ -219,8 +250,120 @@ Output the ratings as a JSON object:"""
             errors=parse_errors if parse_errors else None
         )
     
+    def _call_llm(self, user_prompt: str) -> Dict:
+        """Call LLM based on configured provider."""
+        if self.provider == LLMProvider.ML_COMMONS:
+            return self._call_ml_commons(user_prompt)
+        elif self.provider == LLMProvider.BEDROCK:
+            return self._call_bedrock(user_prompt)
+        else:
+            raise ValueError(f"Unknown provider: {self.provider}")
+    
+    def _call_ml_commons(self, user_prompt: str) -> Dict:
+        """Call LLM via OpenSearch ML-Commons remote connector."""
+        
+        if not self.opensearch_url or not self.llm_model_id:
+            raise ValueError("opensearch_url and llm_model_id required for ML_COMMONS provider")
+        
+        # ML-Commons predict endpoint
+        url = f"{self.opensearch_url}/_plugins/_ml/models/{self.llm_model_id}/_predict"
+        
+        # Build the prompt for remote connector
+        full_prompt = f"{self.SYSTEM_PROMPT}\n\n{user_prompt}"
+        
+        # Request body for remote connector (Claude via Bedrock connector)
+        request_body = {
+            "parameters": {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": full_prompt
+                    }
+                ],
+                "max_tokens": self.max_tokens,
+                "temperature": self.temperature
+            }
+        }
+        
+        try:
+            # Add timeout: 120s for connect, 300s for read (LLM can be slow)
+            response = self._session.post(url, json=request_body, timeout=(120, 300))
+            
+            if response.status_code != 200:
+                raise Exception(f"ML-Commons error: {response.status_code} - {response.text}")
+            
+            result = response.json()
+            
+            # DEBUG: Print raw response to diagnose parsing issues
+            if self._debug:
+                print(f"\n[DEBUG] ML-Commons raw response: {json.dumps(result, indent=2)[:2000]}")
+            
+            # Parse ML-Commons response (structure varies by connector)
+            content = self._extract_content_from_ml_commons(result)
+            
+            if self._debug and content:
+                print(f"[DEBUG] Extracted content: {content[:500]}...")
+            
+            return {
+                'content': content,
+                'total_tokens': 0  # ML-Commons doesn't always return token count
+            }
+            
+        except requests.exceptions.RequestException as e:
+            raise Exception(f"ML-Commons request failed: {str(e)}")
+    
+    def _extract_content_from_ml_commons(self, result: Dict) -> str:
+        """Extract content from various ML-Commons response formats."""
+        
+        inference_results = result.get('inference_results', [])
+        if not inference_results:
+            return ''
+            
+        output = inference_results[0].get('output', [])
+        if not output:
+            return ''
+        
+        # Try direct fields first
+        for field in ['result', 'data', 'text', 'response', 'completion']:
+            if output[0].get(field):
+                return output[0].get(field)
+        
+        # dataAsMap format (most common for remote connectors)
+        data_as_map = output[0].get('dataAsMap', {})
+        if not data_as_map:
+            return ''
+        
+        # Format 1: OpenAI-style (choices[0].message.content)
+        # Used by GPT-3.5, GPT-4 via OpenAI-compatible connectors
+        choices = data_as_map.get('choices', [])
+        if choices and len(choices) > 0:
+            message = choices[0].get('message', {})
+            content = message.get('content', '')
+            if content:
+                return content
+        
+        # Format 2: Claude/Anthropic-style (content[0].text)
+        if 'content' in data_as_map:
+            content_arr = data_as_map['content']
+            if isinstance(content_arr, list) and content_arr:
+                if isinstance(content_arr[0], dict):
+                    return content_arr[0].get('text', '')
+                return str(content_arr[0])
+            return str(content_arr)
+        
+        # Format 3: Simple response field
+        for field in ['response', 'completion', 'text', 'message', 'output']:
+            if data_as_map.get(field):
+                val = data_as_map.get(field)
+                if isinstance(val, str):
+                    return val
+                elif isinstance(val, dict) and 'content' in val:
+                    return val['content']
+        
+        return ''
+    
     def _call_bedrock(self, user_prompt: str) -> Dict:
-        """Call Bedrock Claude API."""
+        """Call Bedrock Claude API directly."""
         
         request_body = {
             "anthropic_version": "bedrock-2023-05-31",
@@ -234,8 +377,8 @@ Output the ratings as a JSON object:"""
             ]
         }
         
-        response = self.client.invoke_model(
-            modelId=self.model_id,
+        response = self.bedrock_client.invoke_model(
+            modelId=self.bedrock_model_id,
             body=json.dumps(request_body),
             contentType="application/json",
             accept="application/json"
@@ -376,27 +519,35 @@ class MockLLMJudge(LLMJudge):
         super().__init__(**kwargs)
         self._call_count = 0
         
-    def _call_bedrock(self, user_prompt: str) -> Dict:
+    def _call_llm(self, user_prompt: str) -> Dict:
         """Generate mock response without API call."""
         self._call_count += 1
         
-        # Extract doc IDs from prompt
-        doc_ids = re.findall(r'\[([^\]]+)\]', user_prompt)
+        # Extract doc IDs from prompt - look for [B0XXXXX] pattern
+        doc_ids = re.findall(r'\[([A-Z0-9]+)\]', user_prompt)
         
-        # Generate consistent pseudo-random ratings
+        if not doc_ids:
+            # Fallback: try any bracketed content
+            doc_ids = re.findall(r'\[([^\]]+)\]', user_prompt)
+        
+        # Generate consistent pseudo-random ratings based on doc_id
+        # Use MD5 hash for deterministic results across Python runs
+        # (Python's hash() is randomized per session for security)
         ratings = {}
         for doc_id in doc_ids:
-            # Use hash for consistency
-            hash_val = hash(doc_id) % 100
-            if hash_val < 20:
+            # Deterministic hash using MD5
+            hash_bytes = hashlib.md5(doc_id.encode()).digest()
+            hash_val = int.from_bytes(hash_bytes[:4], 'big') % 100
+            
+            if hash_val < 10:
                 rating = 0.0
-            elif hash_val < 40:
+            elif hash_val < 25:
                 rating = 0.2
-            elif hash_val < 60:
+            elif hash_val < 45:
                 rating = 0.4
-            elif hash_val < 80:
+            elif hash_val < 70:
                 rating = 0.6
-            elif hash_val < 95:
+            elif hash_val < 90:
                 rating = 0.8
             else:
                 rating = 1.0
