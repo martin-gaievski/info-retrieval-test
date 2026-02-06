@@ -323,9 +323,9 @@ class ESCIComparison:
             docs_for_llm = {}
             for doc_id, doc in pooled_docs.items():
                 # Build combined text for LLM evaluation
-                brand = doc.get("product_brand", "")
-                title = doc.get(self.title_field, "")
-                desc = doc.get(self.text_field, "")[:800]  # Truncate long descriptions
+                brand = doc.get("product_brand", "") or ""
+                title = doc.get(self.title_field, "") or ""
+                desc = (doc.get(self.text_field, "") or "")[:800]  # Truncate long descriptions
                 
                 combined_title = f"{brand} - {title}" if brand else title
                 docs_for_llm[doc_id] = {
