@@ -48,6 +48,67 @@ from dynamic_hybrid.esci_weight_grid_search import (
 )
 
 
+def load_queries_auto(queries_path: str) -> Dict[str, ESCIQuery]:
+    """Auto-detect query file format (JSON or JSONL) and load queries.
+    
+    Supports:
+    - ESCI format: single JSON dict {qid: {query_text: ...}}
+    - BEIR/JSONL format: one JSON object per line with _id and text fields
+    """
+    with open(queries_path, 'r') as f:
+        first_line = f.readline().strip()
+    
+    # Try JSONL first (BEIR format: {"_id": "...", "text": "..."})
+    try:
+        first_obj = json.loads(first_line)
+        if isinstance(first_obj, dict) and '_id' in first_obj and 'text' in first_obj:
+            # JSONL/BEIR format
+            queries = {}
+            with open(queries_path, 'r') as f:
+                for line in f:
+                    data = json.loads(line.strip())
+                    qid = str(data['_id'])
+                    queries[qid] = ESCIQuery(query_id=qid, text=data['text'])
+            return queries
+    except (json.JSONDecodeError, KeyError):
+        pass
+    
+    # Fall back to ESCI JSON format
+    return load_esci_queries(queries_path)
+
+
+def load_qrels_auto(qrels_path: str) -> Dict[str, Dict[str, int]]:
+    """Auto-detect qrels format and load.
+    
+    Supports:
+    - ESCI TSV: 4-column TREC format (qid, 0, docid, score)
+    - BEIR TSV: 3-column format (qid, docid, score)
+    """
+    from collections import defaultdict
+    qrels = defaultdict(dict)
+    with open(qrels_path, 'r') as f:
+        for i, line in enumerate(f):
+            line = line.strip()
+            if not line:
+                continue
+            # Skip header
+            if i == 0 and ('query' in line.lower() or 'corpus' in line.lower()):
+                continue
+            parts = line.split('\t')
+            if len(parts) >= 3:
+                query_id = parts[0]
+                if len(parts) == 4:
+                    # TREC 4-column: qid, 0, docid, score
+                    doc_id = parts[2]
+                    score = int(parts[3])
+                else:
+                    # BEIR 3-column: qid, docid, score
+                    doc_id = parts[1]
+                    score = int(parts[2])
+                qrels[query_id][doc_id] = score
+    return dict(qrels)
+
+
 # ============================================================================
 # GRID CONFIGURATIONS (matches HybridOptimizerExperimentProcessor defaults)
 # ============================================================================
@@ -574,8 +635,8 @@ def main():
     
     # Load queries
     print("\n[Loading data...]")
-    queries = load_esci_queries(args.queries_path)
-    qrels = load_esci_qrels(args.qrels_path)
+    queries = load_queries_auto(args.queries_path)
+    qrels = load_qrels_auto(args.qrels_path)
     print(f"  Loaded {len(queries)} queries, {len(qrels)} with qrels")
     
     # Initialize client
