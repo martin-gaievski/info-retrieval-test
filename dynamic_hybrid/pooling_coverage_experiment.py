@@ -543,6 +543,9 @@ def main():
     parser.add_argument("--port", type=int, default=80, help="OpenSearch port")
     parser.add_argument("--index", default="esci-products", help="Index name")
     parser.add_argument("--embedding-model-id", required=True, help="Embedding model ID")
+    parser.add_argument("--neural-field", default="info_embedding", help="Neural/knn_vector field name")
+    parser.add_argument("--lexical-fields", default="product_title^2.0,product_description",
+                        help="Comma-separated lexical field names")
     parser.add_argument("--queries-path", default="datasets/esci/esci_us_queries_100.json")
     parser.add_argument("--qrels-path", default="datasets/esci/esci_us_qrels_100.tsv")
     parser.add_argument("--llm-cache-file", default="esci_llm_cache_100q_gpt35turbo.json",
@@ -590,13 +593,17 @@ def main():
     sampled_ids = valid_query_ids[:args.num_queries]
     print(f"  Using {len(sampled_ids)} queries")
     
-    # Initialize searcher
+    # Initialize searcher with configurable fields
+    lexical_fields = [f.strip() for f in args.lexical_fields.split(",")]
+    print(f"  Neural field: {args.neural_field}")
+    print(f"  Lexical fields: {lexical_fields}")
+    
     searcher = HybridSearcher(
         client=client,
         index_name=args.index,
         embedding_model_id=args.embedding_model_id,
-        neural_field="info_embedding",
-        lexical_fields=["product_title^2.0", "product_description"]
+        neural_field=args.neural_field,
+        lexical_fields=lexical_fields
     )
     
     # Run experiments
